@@ -1,0 +1,898 @@
+C:\Users\havel\Documents\wi4050\ToySimulatedContinuous.py
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = '0'#0,1,2,3
+
+import torch
+#torch.cuda.set_device(3)
+from torch.utils.data import Dataset, TensorDataset, DataLoader
+import socket
+
+import numpy as np
+import scipy
+import os
+import torch.cuda
+import torch.backends.cudnn as cudnn
+from torch.distributions.multivariate_normal import MultivariateNormal
+from torch.distributions.normal import Normal
+
+
+import pandas as pd
+import graphviz
+import dowhy
+from dowhy import CausalModel
+import networkx as nx
+
+import matplotlib
+# %matplotlib notebook
+# %matplotlib inline  
+from matplotlib import pyplot as plt
+
+import socket
+import datetime
+import math
+import random
+import os
+import sys
+# temp_argv = sys.argv
+import timeit
+
+import pandas as pd
+import seaborn as sns
+
+
+import networkx as nx
+
+# Set manual seed for reproduction of experiments
+# seed = 1
+# seed = random.randint(1, 20000)
+
+# random.seed(seed)
+# np.random.seed(seed=seed)
+# torch.manual_seed(seed)
+# if torch.cuda.is_available():
+#     torch.cuda.manual_seed_all(seed)
+#     torch.backends.cudnn.deterministic = True
+#     torch.backends.cudnn.benchmark = False
+# else:
+#     print("GPU device not available!")
+    
+from torch.distributions.normal import Normal
+
+from timeit import default_timer as timer
+import lib.utils as utils
+from datetime import datetime
+import yaml
+import os
+import UCIdatasets
+import numpy as np
+from models.Normalizers import *
+from models.Conditionners import *
+from models.NormalizingFlowFactories import buildFCNormalizingFlow, buildFCNormalizingFlow_UC
+from models.NormalizingFlow import *
+import math
+import re
+
+
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from PIL import Image
+
+# init_printing(use_unicode=True)
+
+
+class MyDataset(Dataset):
+    def __init__(self, data, targets, transform=None):
+        self.data = data
+        
+    def __getitem__(self, index):
+        x = self.data[index]
+        
+        return x
+    
+    def __len__(self):
+        return len(self.data)
+
+
+def batch_iter(X, batch_size, shuffle=False):
+    """
+    X: feature tensor (shape: num_instances x num_features)
+    """
+    if shuffle:
+        idxs = torch.randperm(X.shape[0])
+    else:
+        idxs = torch.arange(X.shape[0])
+    if X.is_cuda:
+        idxs = idxs.cuda()
+    for batch_idxs in idxs.split(batch_size):
+        yield X[batch_idxs]
+
+
+def load_data(name, alpha=0.2, beta=-0.6, delta=0.72, rho=0.0):
+
+    if name == 'bsds300':
+        return UCIdatasets.BSDS300()
+
+    elif name == 'power':
+        return UCIdatasets.POWER()
+
+    elif name == 'gas':
+        return UCIdatasets.GAS()
+
+    elif name == 'hepmass':
+        return UCIdatasets.HEPMASS()
+
+    elif name == 'miniboone':
+        return UCIdatasets.MINIBOONE()
+
+    elif name == "digits":
+        return UCIdatasets.DIGITS()
+    
+    elif name == "proteins":
+        return UCIdatasets.PROTEINS()
+    
+    elif name == "toy_sim_continuous":
+        return UCIdatasets.TOY_SIM_CONTINUOUS(n_samples=int(40000/.8),# int(400000/.8)
+#                                    new=True, 
+                                   new=False, 
+                                   case='Hoover',
+                                   alpha = alpha,
+                                   beta = beta,
+                                   delta = delta,
+                                   rho = rho,
+                                  )
+    
+    else:
+        raise ValueError('Unknown dataset')
+
+
+cond_types = {"DAG": DAGConditioner, "Coupling": CouplingConditioner, "Autoregressive": AutoregressiveConditioner}
+norm_types = {"affine": AffineNormalizer, "monotonic": MonotonicNormalizer}
+
+
+
+def train(dataset="toy_sim_continuous", load=True, nb_step_dual=100, nb_steps=20, path="", l1=.1, nb_epoch=10000,
+          int_net=[200, 200, 200], emb_net=[200, 200, 200], b_size=128, all_args=None, file_number=None, train=True,
+          solver="CC", nb_flow=1, weight_decay=1e-5, learning_rate=1e-3, cond_type='DAG', norm_type='affine', n_mce_samples=20000, mce_b_size=20000, nb_estop=50,seed=None,
+          alpha=6,beta=0.0, delta=0.0, rho=0.0):
+#     logger = utils.get_logger(logpath=os.path.join(path, 'logs'), filepath=os.path.abspath('/home/user/prj/rhoGNF/ToySimulatedContinuous.py'))
+    logger = utils.get_logger(logpath=os.path.join(path, 'logs'), filepath=__file__)
+    logger.info(str(all_args))
+
+    logger.info("Creating model...")
+
+    device = "cpu" if not(torch.cuda.is_available()) else "cuda:0"
+    
+    # Set manual seed for reproduction of experiments
+    if seed is None:
+        seed = random.randint(1, 20000)
+    logger.info(f"Running simulation with seed {seed}")
+
+
+    random.seed(seed)
+    np.random.seed(seed=seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True
+    else:
+        print("GPU device not available!")
+
+    if load:
+        file_number_str = '_%05d' % file_number if file_number is not None else "_"
+
+    if file_number is None:
+        file_number = 0
+    batch_size = b_size
+
+    logger.info("Loading data...")
+    data = load_data(dataset, 
+                    alpha = alpha,
+                    beta = beta,
+                    delta = delta,
+                    rho = rho,
+                    )
+    data_mu = torch.from_numpy(data.mu).float().to(device)
+    data_sigma = torch.from_numpy(data.sig).float().to(device)
+    logger.info(f"data_mu = \n{data_mu.cpu().numpy()}, \ndata_sigma = \n{data_sigma.cpu().numpy()}")
+
+    logger.info("Data loaded.")
+    
+    logger.info("Creating model...")
+
+    
+    d_trn = TensorDataset(data.trn.x.float())
+    d_val = TensorDataset(data.val.x.float())
+    d_tst = TensorDataset(data.tst.x.float())
+    
+    logger.info(f"Number of samples = trn:{len(d_trn):7d},  val:{len(d_val):7d},  tst:{len(d_tst):7d}")
+
+    import platform
+    workers = 0 if platform.system() == 'Windows' else 4
+    pin_memory = True
+    
+    batch_size = b_size#128#2000#125
+#     batch_size = int(len(d_trn)**(3/4))#2000#125
+#     batch_size = len(d_trn)//16
+#     batch_size = min(batch_size, len(d_trn)//10)
+    
+    logger.info(f"Batch size = trn:{batch_size:7d},  val:{len(d_val):7d},  tst:{len(d_tst):7d}")
+    l_trn = DataLoader(d_trn, 
+                       batch_size=batch_size,
+                             num_workers=int(workers),
+                             shuffle=True,
+                             pin_memory=pin_memory,
+                             drop_last=False) # create your dataloader
+    l_val = DataLoader(d_val, 
+                       batch_size=len(d_val)//4,
+                             num_workers=int(workers),
+                             shuffle=False,
+                             pin_memory=pin_memory,
+                             drop_last=False) # create your dataloader
+    l_tst = DataLoader(d_tst, 
+                       batch_size=len(d_tst)//4,
+                             num_workers=int(workers),
+                             shuffle=False,
+                             pin_memory=pin_memory,
+                             drop_last=False) # create your dataloader
+
+    logger.info(f"Number of batches = trn:{len(l_trn):7d},  val:{len(l_val):7d},  tst:{len(l_tst):7d}")
+    epoch_iters = len(l_trn)
+    
+    logger.info(f"Dataset_mean = {data.mu}")
+    logger.info(f"Dataset_sigma = {data.sig}")
+    
+    
+    dim = data.trn.x.shape[1]
+    conditioner_type = cond_types[cond_type]
+#     print(cond_type)
+#     print(conditioner_type)
+    conditioner_args = {"in_size": dim, "hidden": emb_net[:-1], "out_size": emb_net[-1]}
+    if conditioner_type is DAGConditioner:
+        conditioner_args['l1'] = l1
+        conditioner_args['gumble_T'] = .5
+        conditioner_args['nb_epoch_update'] = nb_step_dual
+        conditioner_args["hot_encoding"] = False#True
+        conditioner_args['A_prior'] = data.A.to(device)
+        conditioner_args['Z_Sigma'] = data.Z_Sigma.to(device)
+        
+    normalizer_type = norm_types[norm_type]
+#     print(norm_type)
+#     print(normalizer_type)
+    if normalizer_type is MonotonicNormalizer:
+        normalizer_args = {"integrand_net": int_net, "cond_size": emb_net[-1], "nb_steps": nb_steps,
+                           "solver": solver, "mu": data_mu, "sigma": data_sigma,
+                           "cat_dims": None}
+#                            "cat_dims": {0:2}}#, 3:2
+    else:
+        normalizer_args = {}
+
+    model = buildFCNormalizingFlow_UC(nb_flow, conditioner_type, conditioner_args, normalizer_type, normalizer_args)
+#     print(model)
+    print(model.getConditioners()[0])
+    print(model.getNormalizers()[0])
+#     print(model.getConditioners()[0].soft_thresholded_A().detach().cpu())
+    _best_valid_loss = np.inf
+
+#     opt = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate, weight_decay=weight_decay, betas=(0.9, 0.999))
+    opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=learning_rate)
+
+    if load:
+        logger.info("Loading model...")
+        model = torch.load(path + '/model%s.pt' % file_number_str, map_location={"cuda:0": device})
+        model.train()
+        if os.path.isfile(path + '/ADAM%s.pt'):
+            opt.load_state_dict(torch.load(path + '/ADAM%s.pt' % file_number_str, map_location={"cuda:0": device}))
+            if device != "cpu":
+                for state in opt.state.values():
+                    for k, v in state.items():
+                        if isinstance(v, torch.Tensor):
+                            state[k] = v.cuda()
+
+    
+    n_mce_samples = n_mce_samples#2000
+
+    Z_do = MultivariateNormal(torch.zeros(dim), data.Z_Sigma)#torch.eye(dim))
+    z_do = Z_do.sample(torch.Size([n_mce_samples]))#.to(device)
+#     print(z_do.shape)
+
+#     l_cat_dims = list(model.cat_dims.keys())
+#     l_n_cats = list(model.cat_dims.values())
+    l_cat_dims = list([0])# specify the location of treatment tensor
+    l_n_cats = list([2])# specify the number of categories of treatment for ATE calculation.
+
+    if len(l_cat_dims) > 1:
+        all_a = torch.cartesian_prod(*[torch.arange(0, n_cat).float() for n_cat in l_n_cats])#.to(device)
+    else:
+        all_a = torch.cartesian_prod(*[torch.arange(0, n_cat).float() for n_cat in l_n_cats]).unsqueeze(-1)#.to(device)
+    
+    z_do_n = z_do.unsqueeze(1).expand(-1, all_a.shape[0], -1).clone()#.to(device)
+    all_a_n=all_a.unsqueeze(0).expand(n_mce_samples,-1,-1)#.to(device)
+
+    z_do_n[:,:,l_cat_dims] = all_a_n
+    z_do_n = z_do_n.transpose_(1,0).reshape(-1,dim).to(device)#.view(-1,n_samples,dim)
+    # z_do_n.view(-1,n_samples,dim)
+    cur_x_do_n_inv = torch.zeros_like(z_do_n)
+    
+#     print(cur_x_do_n_inv.shape)
+#     print(z_do_n.shape)
+    d_z_do_n = TensorDataset(z_do_n)
+    l_z_do_n = DataLoader(d_z_do_n, batch_size=mce_b_size,
+                             num_workers=int(workers),
+                             shuffle=False,
+                             pin_memory=pin_memory,
+                             drop_last=False) # create your dataloader
+
+    n_iters_val = (epoch_iters//4)+1 #50 # check validation loss after 20% of epoch iterations
+    n_ckpt_cycle = (epoch_iters//4)+1 #50 # check validation loss after 20% of epoch iterations
+    n_ckpt_cycle_10 = n_ckpt_cycle*10
+
+
+    x_val_diff_norm_best = np.inf
+    x_tst_diff_norm_best = np.inf
+    x_val_do_diff_norm_best = np.inf
+    x_tst_do_diff_norm_best = np.inf
+
+    model.to(device)
+    nb_iters = nb_epoch*epoch_iters
+
+    # create dataloader-iterator
+    l_trn_iter = iter(l_trn) 
+
+    n_estop = 0
+    n_iters = 0
+    
+    for epoch in range(file_number+1, file_number+1+nb_epoch):
+                
+        ll_tot = 0
+        start = timer()
+
+        # Update constraints
+        if conditioner_type is DAGConditioner:
+            with torch.no_grad():
+                for conditioner in model.getConditioners():
+                    conditioner.constrainA(zero_threshold=0.)
+
+        # Training loop
+        if train:
+            model.train()
+            if n_estop > nb_estop:
+                break
+            for i, cur_x in enumerate(l_trn):
+                n_iters += 1
+                cur_x=cur_x[0].to(device)
+                if normalizer_type is MonotonicNormalizer:
+                    for normalizer in model.getNormalizers():
+                        normalizer.nb_steps = nb_steps + torch.randint(0, 10, [1])[0].item()
+
+                z, jac = model(cur_x)
+#                 print(z.mean(), jac.mean())
+
+                loss = model.loss(z, jac)
+                if math.isnan(loss.item()) or math.isinf(loss.abs().item()):
+#                     torch.save(model.state_dict(), path + '/NANmodel.pt')
+                    torch.save(model, path + '/NANmodel.pt')
+                    logger.info("Error NAN in loss")
+                    exit()
+                ll_tot += loss.detach()
+                opt.zero_grad()
+                loss.backward(retain_graph=True)
+                opt.step()
+
+                if n_iters % n_iters_val==0:
+                    n_estop += n_iters_val/epoch_iters
+                    model.eval()
+                    ll_val = 0.
+                    x_val_diff_norm = 0
+                    x_val_do_diff_norm = 0
+                    z_val_diff_norm = 0
+                    z_val_do_diff_norm = 0
+                    with torch.no_grad():
+                        if normalizer_type is MonotonicNormalizer:
+                            for normalizer in model.getNormalizers():
+                                normalizer.nb_steps = nb_steps + 20
+                        for i, cur_x in enumerate(l_val):
+                            cur_x=cur_x[0].to(device)
+                            z, jac = model(cur_x)
+
+                            ll = (model.z_log_density(z) + jac)
+                            ll_val += ll.mean().item()
+                        ll_val /= i + 1
+
+
+                        end = timer()
+                        dagness = max(model.DAGness())
+                        logger.info("epoch: {:d} - Train loss: {:4f} - Valid log-likelihood: {:4f} - <<DAGness>>: {:4f} - Elapsed time per epoch {:4f} (seconds)".
+                                    format(epoch, ll_tot.item(), ll_val, dagness, end-start))
+
+
+                        if dagness < 1e-20 and -ll_val < _best_valid_loss:
+                            n_estop = 0
+                            _best_valid_loss = -ll_val
+                            logger.info("------- New best validation loss --------")
+                            logger.info("++ epoch: {:d} - Train loss: {:4f} - Valid log-likelihood: {:4f} - <<DAGness>>: {:4f} - Elapsed time per epoch {:4f} (seconds)".
+                                    format(epoch, ll_tot.item(), ll_val, dagness, end-start))
+                            torch.save(model, path + '/_best_model.pt')
+                            torch.save(opt.state_dict(), path + '/_best_optimizer.pt')
+
+                            x_val_diff_norm = 0
+                            x_val_do_diff_norm = 0
+                            z_val_diff_norm = 0
+                            z_val_do_diff_norm = 0
+                            for i, cur_x in enumerate(l_val):
+                                cur_x=cur_x[0].to(device)
+                                z, jac = model(cur_x)
+
+                                cur_x_do_inv = model.invert(z, do_idx=[0], do_val=torch.narrow(cur_x,1,0,1))
+                                z_do_inv, _ = model(cur_x_do_inv)#.to(device)
+                                cur_x_inv = model.invert(z)
+                                z_inv, _ = model(cur_x_inv)#.to(device)
+                                x_val_diff_norm += torch.norm(cur_x - cur_x_inv)
+                                x_val_do_diff_norm += torch.norm(cur_x - cur_x_do_inv)
+                                z_val_diff_norm += torch.norm(z - z_inv)
+                                z_val_do_diff_norm += torch.norm(z - z_do_inv)
+
+                            if x_val_diff_norm > 1e-8 or z_val_diff_norm > 1e-8 or x_val_do_diff_norm > 1e-8 or z_val_do_diff_norm > 1e-8:
+                                logger.info(f'# {len(d_trn)} e{epoch}: i{n_iters} - ||x_val_diff||={x_val_diff_norm:8.5f}, ||z_val_diff||={z_val_diff_norm:8.5f}, \ne{epoch}: i{n_iters} - ||x_val_do_diff||={x_val_do_diff_norm:8.5f}, ||z_val_do_diff||={z_val_do_diff_norm:8.5f}')
+                            elif x_val_diff_norm > 1e-4 or z_val_diff_norm > 1e-4 or x_val_do_diff_norm > 1e-4 or z_val_do_diff_norm > 1e-4:
+                                logger.info(f'# {len(d_trn)} x_val=\n{cur_x[:2,:]},\nx_val_inv=\n{cur_x_inv[:2,:]},\nx_val_do_inv=\n{cur_x_do_inv[:2,:]}')
+                                logger.info(f'# {len(d_trn)} e{epoch}: i{n_iters} - ||x_val_diff||={x_val_diff_norm:8.5f}, ||z_val_diff||={z_val_diff_norm:8.5f}, \ne{epoch}: i{n_iters} - ||x_val_do_diff||={x_val_do_diff_norm:8.5f}, ||z_val_do_diff||={z_val_do_diff_norm:8.5f}')
+                            else:
+                                pass
+#                                 logger.info('full invertibility achieved!!!')
+
+                            if x_val_diff_norm < x_val_diff_norm_best:
+                                x_val_diff_norm_best = x_val_diff_norm
+                                torch.save(model, path + '/_best_val_consistent_model.pt')
+
+
+                            if x_val_do_diff_norm < x_val_do_diff_norm_best:
+                                x_val_do_diff_norm_best = x_val_do_diff_norm
+                                torch.save(model, path + '/_best_val_do_consistent_model.pt')
+
+                            # perform counterfactual inference by doing all the treatments for the full population
+                            cur_x_do_inv = model.invert(z_do_n, do_idx=l_cat_dims, do_val=torch.narrow(z_do_n,1,min(l_cat_dims),len(l_cat_dims)))
+                            cur_x_do_inv = cur_x_do_inv.view(-1,n_mce_samples,dim)
+                            cur_x_do_n_inv_mean=cur_x_do_inv.mean(1).cpu().numpy()
+                            logger.info(f'# {len(d_trn)} ++ cur_x_do_n_inv_mean=\n{cur_x_do_n_inv_mean}')
+                            lambda_ate = cur_x_do_n_inv_mean[1,-1]-cur_x_do_n_inv_mean[0,-1]
+                            logger.info(f'# {len(d_trn)} ++ e{epoch}: i{n_iters} - lambda_ate = [{lambda_ate:.5f}], TRUE_ATE = [{data.ATE:.5f}], beta = [{beta:.5f}]')
+
+                            # Open a file with access mode 'a'
+                            with open(path + "/_best_ATE_lambda.txt", "a") as file_object:
+                                file_object.write(f'  ,  [{lambda_ate:.5f}]  # {len(d_trn)} ++ e{epoch}: i{n_iters} - lambda_ate =, TRUE_ATE = [{data.ATE:.5f}], beta = [{beta:.5f}]\n')
+
+                    torch.save(model, path + '/model.pt')
+                    torch.save(opt.state_dict(), path + '/ADAM.pt')
+
+                    model.train()
+            ll_tot /= i + 1
+            model.step(epoch, ll_tot)
+        else:
+            ll_tot = 0.
+
+    with open(path + "/_best_ATE_lambda.txt", "a") as file_object:
+        file_object.write(f'# {len(d_trn)} xx e{epoch}: i{n_iters} - lambda_ate =  ,  [{lambda_ate:.5f}], TRUE_ATE = [{data.ATE:.5f}], beta = [{beta:.5f}]\n')
+
+              
+
+
+def make_graph(adjacency_matrix, labels=None):
+    idx = np.abs(adjacency_matrix) > 0.01
+    dirs = np.where(idx)
+#     print(dirs)
+    d = graphviz.Digraph(engine='dot')
+#     print(len(adjacency_matrix))
+#     print(labels)
+    names = labels if labels else [f'x{i}' for i in range(len(adjacency_matrix))]
+    for name in names:
+        d.node(name)
+    for to, from_, coef in zip(dirs[0], dirs[1], adjacency_matrix[idx]):
+        d.edge(names[from_], names[to], label=str(coef))
+    return d
+
+def str_to_dot(string):
+    '''
+    Converts input string from graphviz library to valid DOT graph format.
+    '''
+    graph = string.replace('\n', ';').replace('\t','')
+    graph = graph[:9] + graph[10:-2] + graph[-1] # Removing unnecessary characters from string
+    return graph
+
+
+import argparse
+datasets = ["toy_sim_continuous", "power", "gas", "bsds300", "miniboone", "hepmass", "digits", "proteins"]
+
+parser = argparse.ArgumentParser(description='')
+parser.add_argument("-load_config", default=None, type=str)
+# General Parameters
+parser.add_argument("-dataset", default='toy_sim_continuous', choices=datasets, help="Which toy problem ?")
+# parser.add_argument("-dataset", default='proteins', choices=datasets, help="Which toy problem ?")
+parser.add_argument("-load", default=False, action="store_true", help="Load a model ?")
+parser.add_argument("-folder", default="", help="Folder")
+parser.add_argument("-f_number", default=None, type=int, help="Number of heating steps.")
+parser.add_argument("-test", default=False, action="store_true")
+parser.add_argument("-nb_flow", type=int, default=1, help="Number of steps in the flow.")
+parser.add_argument("-alpha", default=0.2, type=float, help="Average Causal Effect (ACE)")
+parser.add_argument("-beta", default=-0.6, type=float, help="Correaltion coefficient of the Hoover model noise")
+parser.add_argument("-delta", default=0.72, type=float, help="Variance of Z_Y noise in the Hoover model")
+parser.add_argument("-rho", default=0.0, type=float, help="The strength of confounding from the Gaussian copula")# rho=0 => unconfoundedness
+
+
+# Optim Parameters
+parser.add_argument("-weight_decay", default=1e-5, type=float, help="Weight decay value")
+parser.add_argument("-learning_rate", default=3e-4, type=float, help="Weight decay value")
+parser.add_argument("-nb_epoch", default=50000, type=int, help="Number of epochs")
+parser.add_argument("-b_size", default=128, type=int, help="Batch size")
+# 
+# Conditioner Parameters
+parser.add_argument("-conditioner", default='DAG', choices=['DAG', 'Coupling', 'Autoregressive'], type=str)
+# parser.add_argument("-emb_net", default=[60, 60, 60, 30], nargs="+", type=int, help="NN layers of embedding")
+parser.add_argument("-emb_net", default=[20, 15, 10], nargs="+", type=int, help="NN layers of graphical conditioner embedding")
+# Specific for DAG:
+parser.add_argument("-nb_steps_dual", default=50, type=int, help="number of step between updating Acyclicity constraint and sparsity constraint")
+parser.add_argument("-l1", default=0.5, type=float, help="Maximum weight for l1 regularization")
+parser.add_argument("-gumble_T", default=0.5, type=float, help="Temperature of the gumble distribution.")
+
+# Normalizer Parameters
+parser.add_argument("-normalizer", default='monotonic', choices=['affine', 'monotonic'], type=str)
+# parser.add_argument("-int_net", default=[100, 100, 100], nargs="+", type=int, help="NN hidden layers of UMNN")
+parser.add_argument("-int_net", default=[15, 10, 5], nargs="+", type=int, help="NN hidden layers of UMNN transformer")
+parser.add_argument("-nb_steps", default=50, type=int, help="Number of integration steps.")
+parser.add_argument("-nb_estop", default=50, type=int, help="Number of epochs for early stopping.")
+parser.add_argument("-n_mce_samples", default=2000, type=int, help="Number of Monte-Carlo mean estimation samples.")
+parser.add_argument("-mce_b_size", default=2000, type=int, help="Monte-Carlo mean estimation Batch size")
+parser.add_argument("-solver", default="CC", type=str, help="Which integral solver to use.",
+                    choices=["CC", "CCParallel"])
+
+# try:
+#     sys.argv = ['']
+#     print(sys.argv)
+#     args = parser.parse_args()
+# finally:
+#     sys.argv = temp_argv
+#     print(sys.argv)
+args = parser.parse_args()
+    
+now = datetime.now()
+# loader = yaml.SafeLoader
+# loader.add_implicit_resolver(
+#     u'tag:yaml.org,2002:float',
+#     re.compile(u'''^(?:
+#      [-+]?(?:[0-9][0-9_]*)\\.[0-9_]*(?:[eE][-+]?[0-9]+)?
+#     |[-+]?(?:[0-9][0-9_]*)(?:[eE][-+]?[0-9]+)
+#     |\\.[0-9_]+(?:[eE][-+][0-9]+)?
+#     |[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*
+#     |[-+]?\\.(?:inf|Inf|INF)
+#     |\\.(?:nan|NaN|NAN))$''', re.X),
+#     list(u'-+0123456789.'))
+# if args.load_config is not None:
+#     with open("UCIExperimentsConfigurations.yml", 'r') as stream:
+#         try:
+#             configs = yaml.load(stream, Loader=loader)[args.load_config]
+#             for key, val in configs.items():
+#                 setattr(args, key, val)
+#         except yaml.YAMLError as exc:
+#             print(exc)
+
+
+dir_name = args.dataset if args.load_config is None else args.load_config
+machinename = socket.gethostname()
+path = "NeurIPS2022_rhoGNF/" + dir_name + "/" + now.strftime("%Y_%m_%d_%H_%M_%S") + '_' + machinename + '_alpha_' +  f'{args.alpha:.3f}' + '_beta_' +  f'{args.beta:.4f}'  + '_delta_' +  f'{args.delta:.3f}'  + '_rho_' +  f'{args.rho:.3f}' if args.folder == "" else args.folder
+if not(os.path.isdir(path)):
+    os.makedirs(path)
+train(args.dataset, load=args.load, path=path, nb_step_dual=args.nb_steps_dual, l1=args.l1, nb_epoch=args.nb_epoch, nb_estop=args.nb_estop,
+      int_net=args.int_net, emb_net=args.emb_net, b_size=args.b_size, all_args=args,
+      nb_steps=args.nb_steps, file_number=args.f_number,  solver=args.solver, nb_flow=args.nb_flow,
+      train=not args.test, weight_decay=args.weight_decay, learning_rate=args.learning_rate,
+      cond_type=args.conditioner,  norm_type=args.normalizer,  n_mce_samples=args.n_mce_samples, mce_b_size=args.mce_b_size, alpha=args.alpha, beta=args.beta, delta=args.delta, rho=args.rho)
+
+# sed -i 's/#.*= / /g' *.log & sed -i 's/==>/# ==>/g' *.log &
+Namespace(load_config=None, dataset='toy_sim_continuous', load=False, folder='', f_number=None, test=False, nb_flow=1, alpha=0.2, beta=-0.6, delta=0.72, rho=-0.55, weight_decay=1e-05, learning_rate=0.0003, nb_epoch=50000, b_size=128, conditioner='DAG', emb_net=[20, 15, 10], nb_steps_dual=50, l1=0.5, gumble_T=0.5, normalizer='monotonic', int_net=[15, 10, 5], nb_steps=50, nb_estop=50, n_mce_samples=2000, mce_b_size=2000, solver='CC')
+Creating model...
+Running simulation with seed 17722
+Loading data...
+data_mu = 
+[ 0.00644546 -0.00356122], 
+data_sigma = 
+[0.99897605 0.71967936]
+Data loaded.
+Creating model...
+Number of samples = trn:  45000,  val:   5000,  tst:   5000
+Batch size = trn:    128,  val:   5000,  tst:   5000
+Number of batches = trn:    352,  val:      4,  tst:      4
+Dataset_mean = [ 0.00644546 -0.00356122]
+Dataset_sigma = [0.99897605 0.71967936]
+epoch: 1 - Train loss: 219.646378 - Valid log-likelihood: -2.337906 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.854959 (seconds)
+------- New best validation loss --------
+++ epoch: 1 - Train loss: 219.646378 - Valid log-likelihood: -2.337906 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.854959 (seconds)
+# 45000 e1: i89 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e1: i89 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.01334516]
+ [ 1.         -0.00929553]]
+# 45000 ++ e1: i89 - lambda_ate = [0.00405], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 1 - Train loss: 437.117188 - Valid log-likelihood: -2.330816 - <<DAGness>>: 0.000000 - Elapsed time per epoch 34.977502 (seconds)
+------- New best validation loss --------
+++ epoch: 1 - Train loss: 437.117188 - Valid log-likelihood: -2.330816 - <<DAGness>>: 0.000000 - Elapsed time per epoch 34.977502 (seconds)
+# 45000 e1: i178 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e1: i178 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.01934475]
+ [ 1.         -0.02105181]]
+# 45000 ++ e1: i178 - lambda_ate = [-0.00171], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 1 - Train loss: 655.440002 - Valid log-likelihood: -2.328113 - <<DAGness>>: 0.000000 - Elapsed time per epoch 63.695572 (seconds)
+------- New best validation loss --------
+++ epoch: 1 - Train loss: 655.440002 - Valid log-likelihood: -2.328113 - <<DAGness>>: 0.000000 - Elapsed time per epoch 63.695572 (seconds)
+# 45000 e1: i267 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e1: i267 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.02130627]
+ [ 1.         -0.01398666]]
+# 45000 ++ e1: i267 - lambda_ate = [0.00732], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 2 - Train loss: 9.932802 - Valid log-likelihood: -2.327775 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.410819 (seconds)
+------- New best validation loss --------
+++ epoch: 2 - Train loss: 9.932802 - Valid log-likelihood: -2.327775 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.410819 (seconds)
+# 45000 e2: i356 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e2: i356 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.02614459]
+ [ 1.         -0.02077373]]
+# 45000 ++ e2: i356 - lambda_ate = [0.00537], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 2 - Train loss: 227.543839 - Valid log-likelihood: -2.327925 - <<DAGness>>: 0.000000 - Elapsed time per epoch 29.486758 (seconds)
+epoch: 2 - Train loss: 443.497833 - Valid log-likelihood: -2.328083 - <<DAGness>>: 0.000000 - Elapsed time per epoch 35.373377 (seconds)
+epoch: 2 - Train loss: 661.602173 - Valid log-likelihood: -2.328044 - <<DAGness>>: 0.000000 - Elapsed time per epoch 41.220629 (seconds)
+epoch: 3 - Train loss: 19.608688 - Valid log-likelihood: -2.327700 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.664862 (seconds)
+------- New best validation loss --------
+++ epoch: 3 - Train loss: 19.608688 - Valid log-likelihood: -2.327700 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.664862 (seconds)
+# 45000 e3: i712 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e3: i712 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.01876516]
+ [ 1.         -0.00732277]]
+# 45000 ++ e3: i712 - lambda_ate = [0.01144], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 3 - Train loss: 237.107895 - Valid log-likelihood: -2.327485 - <<DAGness>>: 0.000000 - Elapsed time per epoch 29.587001 (seconds)
+------- New best validation loss --------
+++ epoch: 3 - Train loss: 237.107895 - Valid log-likelihood: -2.327485 - <<DAGness>>: 0.000000 - Elapsed time per epoch 29.587001 (seconds)
+# 45000 e3: i801 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e3: i801 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.02914462]
+ [ 1.         -0.0208475 ]]
+# 45000 ++ e3: i801 - lambda_ate = [0.00830], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 3 - Train loss: 454.551300 - Valid log-likelihood: -2.327593 - <<DAGness>>: 0.000000 - Elapsed time per epoch 59.275341 (seconds)
+epoch: 3 - Train loss: 672.625061 - Valid log-likelihood: -2.327741 - <<DAGness>>: 0.000000 - Elapsed time per epoch 65.202214 (seconds)
+epoch: 4 - Train loss: 29.050615 - Valid log-likelihood: -2.328160 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.944859 (seconds)
+epoch: 4 - Train loss: 246.875656 - Valid log-likelihood: -2.327713 - <<DAGness>>: 0.000000 - Elapsed time per epoch 6.911526 (seconds)
+epoch: 4 - Train loss: 464.899597 - Valid log-likelihood: -2.327687 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.900124 (seconds)
+epoch: 4 - Train loss: 683.062866 - Valid log-likelihood: -2.327537 - <<DAGness>>: 0.000000 - Elapsed time per epoch 18.906932 (seconds)
+epoch: 5 - Train loss: 39.480385 - Valid log-likelihood: -2.327516 - <<DAGness>>: 0.000000 - Elapsed time per epoch 1.180845 (seconds)
+epoch: 5 - Train loss: 255.901855 - Valid log-likelihood: -2.327553 - <<DAGness>>: 0.000000 - Elapsed time per epoch 7.165867 (seconds)
+epoch: 5 - Train loss: 474.230865 - Valid log-likelihood: -2.327662 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.053082 (seconds)
+epoch: 5 - Train loss: 692.646667 - Valid log-likelihood: -2.328723 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.756385 (seconds)
+epoch: 6 - Train loss: 48.715099 - Valid log-likelihood: -2.327581 - <<DAGness>>: 0.000000 - Elapsed time per epoch 1.478112 (seconds)
+epoch: 6 - Train loss: 266.972137 - Valid log-likelihood: -2.328310 - <<DAGness>>: 0.000000 - Elapsed time per epoch 7.510517 (seconds)
+epoch: 6 - Train loss: 483.594879 - Valid log-likelihood: -2.327604 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.502909 (seconds)
+epoch: 6 - Train loss: 702.154663 - Valid log-likelihood: -2.327826 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.633929 (seconds)
+epoch: 7 - Train loss: 58.234619 - Valid log-likelihood: -2.327635 - <<DAGness>>: 0.000000 - Elapsed time per epoch 1.729015 (seconds)
+epoch: 7 - Train loss: 275.502045 - Valid log-likelihood: -2.327996 - <<DAGness>>: 0.000000 - Elapsed time per epoch 7.707292 (seconds)
+epoch: 7 - Train loss: 493.803925 - Valid log-likelihood: -2.327450 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.744179 (seconds)
+------- New best validation loss --------
+++ epoch: 7 - Train loss: 493.803925 - Valid log-likelihood: -2.327450 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.744179 (seconds)
+# 45000 e7: i2314 - ||x_val_diff||= 0.00002, ||z_val_diff||= 0.00002, 
+e7: i2314 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.03077711]
+ [ 1.         -0.02735521]]
+# 45000 ++ e7: i2314 - lambda_ate = [0.00342], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 7 - Train loss: 712.218018 - Valid log-likelihood: -2.327562 - <<DAGness>>: 0.000000 - Elapsed time per epoch 43.403390 (seconds)
+epoch: 8 - Train loss: 69.165909 - Valid log-likelihood: -2.327889 - <<DAGness>>: 0.000000 - Elapsed time per epoch 1.904290 (seconds)
+epoch: 8 - Train loss: 287.046875 - Valid log-likelihood: -2.327632 - <<DAGness>>: 0.000000 - Elapsed time per epoch 7.740728 (seconds)
+epoch: 8 - Train loss: 504.260162 - Valid log-likelihood: -2.327507 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.490135 (seconds)
+epoch: 8 - Train loss: 721.035645 - Valid log-likelihood: -2.328009 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.319461 (seconds)
+epoch: 9 - Train loss: 78.932121 - Valid log-likelihood: -2.327487 - <<DAGness>>: 0.000000 - Elapsed time per epoch 2.213622 (seconds)
+epoch: 9 - Train loss: 296.541687 - Valid log-likelihood: -2.327736 - <<DAGness>>: 0.000000 - Elapsed time per epoch 8.050809 (seconds)
+epoch: 9 - Train loss: 514.835754 - Valid log-likelihood: -2.327652 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.886756 (seconds)
+epoch: 9 - Train loss: 731.761475 - Valid log-likelihood: -2.327603 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.670319 (seconds)
+epoch: 10 - Train loss: 87.939957 - Valid log-likelihood: -2.327404 - <<DAGness>>: 0.000000 - Elapsed time per epoch 2.425148 (seconds)
+------- New best validation loss --------
+++ epoch: 10 - Train loss: 87.939957 - Valid log-likelihood: -2.327404 - <<DAGness>>: 0.000000 - Elapsed time per epoch 2.425148 (seconds)
+# 45000 e10: i3204 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e10: i3204 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.02462557]
+ [ 1.         -0.02425707]]
+# 45000 ++ e10: i3204 - lambda_ate = [0.00037], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 10 - Train loss: 306.112854 - Valid log-likelihood: -2.327559 - <<DAGness>>: 0.000000 - Elapsed time per epoch 31.368458 (seconds)
+epoch: 10 - Train loss: 523.061646 - Valid log-likelihood: -2.327802 - <<DAGness>>: 0.000000 - Elapsed time per epoch 37.158371 (seconds)
+epoch: 10 - Train loss: 740.635803 - Valid log-likelihood: -2.327694 - <<DAGness>>: 0.000000 - Elapsed time per epoch 42.937644 (seconds)
+epoch: 11 - Train loss: 97.270248 - Valid log-likelihood: -2.327420 - <<DAGness>>: 0.000000 - Elapsed time per epoch 2.722080 (seconds)
+epoch: 11 - Train loss: 314.225067 - Valid log-likelihood: -2.327613 - <<DAGness>>: 0.000000 - Elapsed time per epoch 8.603453 (seconds)
+epoch: 11 - Train loss: 532.561096 - Valid log-likelihood: -2.327913 - <<DAGness>>: 0.000000 - Elapsed time per epoch 14.502684 (seconds)
+epoch: 11 - Train loss: 750.694763 - Valid log-likelihood: -2.327527 - <<DAGness>>: 0.000000 - Elapsed time per epoch 20.313158 (seconds)
+epoch: 12 - Train loss: 107.679970 - Valid log-likelihood: -2.327418 - <<DAGness>>: 0.000000 - Elapsed time per epoch 3.087975 (seconds)
+epoch: 12 - Train loss: 324.498596 - Valid log-likelihood: -2.327589 - <<DAGness>>: 0.000000 - Elapsed time per epoch 8.880660 (seconds)
+epoch: 12 - Train loss: 542.919189 - Valid log-likelihood: -2.327395 - <<DAGness>>: 0.000000 - Elapsed time per epoch 14.697885 (seconds)
+------- New best validation loss --------
+++ epoch: 12 - Train loss: 542.919189 - Valid log-likelihood: -2.327395 - <<DAGness>>: 0.000000 - Elapsed time per epoch 14.697885 (seconds)
+# 45000 e12: i4094 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e12: i4094 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.02440136]
+ [ 1.         -0.02933275]]
+# 45000 ++ e12: i4094 - lambda_ate = [-0.00493], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 12 - Train loss: 760.148682 - Valid log-likelihood: -2.328019 - <<DAGness>>: 0.000000 - Elapsed time per epoch 43.442143 (seconds)
+epoch: 13 - Train loss: 116.413696 - Valid log-likelihood: -2.327682 - <<DAGness>>: 0.000000 - Elapsed time per epoch 3.255583 (seconds)
+epoch: 13 - Train loss: 333.810944 - Valid log-likelihood: -2.327743 - <<DAGness>>: 0.000000 - Elapsed time per epoch 9.257424 (seconds)
+epoch: 13 - Train loss: 552.631226 - Valid log-likelihood: -2.327965 - <<DAGness>>: 0.000000 - Elapsed time per epoch 15.209128 (seconds)
+epoch: 13 - Train loss: 770.940979 - Valid log-likelihood: -2.327552 - <<DAGness>>: 0.000000 - Elapsed time per epoch 21.176939 (seconds)
+epoch: 14 - Train loss: 127.692200 - Valid log-likelihood: -2.327799 - <<DAGness>>: 0.000000 - Elapsed time per epoch 3.469201 (seconds)
+epoch: 14 - Train loss: 345.666199 - Valid log-likelihood: -2.327628 - <<DAGness>>: 0.000000 - Elapsed time per epoch 9.342607 (seconds)
+epoch: 14 - Train loss: 562.526306 - Valid log-likelihood: -2.327610 - <<DAGness>>: 0.000000 - Elapsed time per epoch 15.108561 (seconds)
+epoch: 14 - Train loss: 779.633179 - Valid log-likelihood: -2.327477 - <<DAGness>>: 0.000000 - Elapsed time per epoch 20.937136 (seconds)
+epoch: 15 - Train loss: 137.217484 - Valid log-likelihood: -2.327563 - <<DAGness>>: 0.000000 - Elapsed time per epoch 3.984541 (seconds)
+epoch: 15 - Train loss: 355.986725 - Valid log-likelihood: -2.327531 - <<DAGness>>: 0.000000 - Elapsed time per epoch 10.514195 (seconds)
+epoch: 15 - Train loss: 572.870972 - Valid log-likelihood: -2.327650 - <<DAGness>>: 0.000000 - Elapsed time per epoch 16.369570 (seconds)
+epoch: 15 - Train loss: 790.250061 - Valid log-likelihood: -2.327532 - <<DAGness>>: 0.000000 - Elapsed time per epoch 23.440700 (seconds)
+epoch: 16 - Train loss: 146.789185 - Valid log-likelihood: -2.327437 - <<DAGness>>: 0.000000 - Elapsed time per epoch 4.734516 (seconds)
+epoch: 16 - Train loss: 365.183136 - Valid log-likelihood: -2.327432 - <<DAGness>>: 0.000000 - Elapsed time per epoch 10.594861 (seconds)
+epoch: 16 - Train loss: 582.303833 - Valid log-likelihood: -2.328060 - <<DAGness>>: 0.000000 - Elapsed time per epoch 16.561634 (seconds)
+epoch: 16 - Train loss: 799.585022 - Valid log-likelihood: -2.327540 - <<DAGness>>: 0.000000 - Elapsed time per epoch 22.469586 (seconds)
+epoch: 17 - Train loss: 157.055557 - Valid log-likelihood: -2.327710 - <<DAGness>>: 0.000000 - Elapsed time per epoch 4.308670 (seconds)
+epoch: 17 - Train loss: 374.692749 - Valid log-likelihood: -2.327787 - <<DAGness>>: 0.000000 - Elapsed time per epoch 11.234229 (seconds)
+epoch: 17 - Train loss: 592.038025 - Valid log-likelihood: -2.327560 - <<DAGness>>: 0.000000 - Elapsed time per epoch 18.959233 (seconds)
+epoch: 17 - Train loss: 808.907227 - Valid log-likelihood: -2.327825 - <<DAGness>>: 0.000000 - Elapsed time per epoch 26.764285 (seconds)
+epoch: 18 - Train loss: 166.208649 - Valid log-likelihood: -2.327662 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.362800 (seconds)
+epoch: 18 - Train loss: 383.482910 - Valid log-likelihood: -2.327435 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.737529 (seconds)
+epoch: 18 - Train loss: 600.891968 - Valid log-likelihood: -2.327621 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.503725 (seconds)
+epoch: 18 - Train loss: 818.938599 - Valid log-likelihood: -2.327496 - <<DAGness>>: 0.000000 - Elapsed time per epoch 26.595708 (seconds)
+epoch: 19 - Train loss: 176.093811 - Valid log-likelihood: -2.327640 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.491871 (seconds)
+epoch: 19 - Train loss: 393.914459 - Valid log-likelihood: -2.327431 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.596602 (seconds)
+epoch: 19 - Train loss: 610.976929 - Valid log-likelihood: -2.327829 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.410190 (seconds)
+epoch: 19 - Train loss: 829.421448 - Valid log-likelihood: -2.327570 - <<DAGness>>: 0.000000 - Elapsed time per epoch 26.229421 (seconds)
+epoch: 20 - Train loss: 186.208740 - Valid log-likelihood: -2.327432 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.161866 (seconds)
+epoch: 20 - Train loss: 404.080475 - Valid log-likelihood: -2.328016 - <<DAGness>>: 0.000000 - Elapsed time per epoch 11.305571 (seconds)
+epoch: 20 - Train loss: 622.037598 - Valid log-likelihood: -2.328062 - <<DAGness>>: 0.000000 - Elapsed time per epoch 17.288500 (seconds)
+epoch: 20 - Train loss: 838.919617 - Valid log-likelihood: -2.327696 - <<DAGness>>: 0.000000 - Elapsed time per epoch 23.215742 (seconds)
+epoch: 21 - Train loss: 195.696899 - Valid log-likelihood: -2.327421 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.340052 (seconds)
+epoch: 21 - Train loss: 412.727295 - Valid log-likelihood: -2.327692 - <<DAGness>>: 0.000000 - Elapsed time per epoch 11.303824 (seconds)
+epoch: 21 - Train loss: 630.223633 - Valid log-likelihood: -2.327775 - <<DAGness>>: 0.000000 - Elapsed time per epoch 17.120689 (seconds)
+epoch: 21 - Train loss: 848.705444 - Valid log-likelihood: -2.327486 - <<DAGness>>: 0.000000 - Elapsed time per epoch 23.170115 (seconds)
+epoch: 22 - Train loss: 205.620865 - Valid log-likelihood: -2.327470 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.695559 (seconds)
+epoch: 22 - Train loss: 423.387482 - Valid log-likelihood: -2.327583 - <<DAGness>>: 0.000000 - Elapsed time per epoch 11.613402 (seconds)
+epoch: 22 - Train loss: 640.924744 - Valid log-likelihood: -2.327497 - <<DAGness>>: 0.000000 - Elapsed time per epoch 17.460224 (seconds)
+epoch: 22 - Train loss: 858.515137 - Valid log-likelihood: -2.327476 - <<DAGness>>: 0.000000 - Elapsed time per epoch 23.444959 (seconds)
+epoch: 23 - Train loss: 215.189285 - Valid log-likelihood: -2.327625 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.862996 (seconds)
+epoch: 23 - Train loss: 433.357635 - Valid log-likelihood: -2.327348 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.029672 (seconds)
+------- New best validation loss --------
+++ epoch: 23 - Train loss: 433.357635 - Valid log-likelihood: -2.327348 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.029672 (seconds)
+# 45000 e23: i7921 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e23: i7921 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.02405261]
+ [ 1.         -0.02840135]]
+# 45000 ++ e23: i7921 - lambda_ate = [-0.00435], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 23 - Train loss: 651.034363 - Valid log-likelihood: -2.328629 - <<DAGness>>: 0.000000 - Elapsed time per epoch 41.041457 (seconds)
+epoch: 24 - Train loss: 7.313402 - Valid log-likelihood: -2.327608 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.353466 (seconds)
+epoch: 24 - Train loss: 225.969635 - Valid log-likelihood: -2.328200 - <<DAGness>>: 0.000000 - Elapsed time per epoch 6.159500 (seconds)
+epoch: 24 - Train loss: 442.302795 - Valid log-likelihood: -2.327726 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.160393 (seconds)
+epoch: 24 - Train loss: 659.134827 - Valid log-likelihood: -2.327740 - <<DAGness>>: 0.000000 - Elapsed time per epoch 18.067696 (seconds)
+epoch: 25 - Train loss: 17.078186 - Valid log-likelihood: -2.327524 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.606935 (seconds)
+epoch: 25 - Train loss: 235.501556 - Valid log-likelihood: -2.327373 - <<DAGness>>: 0.000000 - Elapsed time per epoch 6.978443 (seconds)
+epoch: 25 - Train loss: 453.086182 - Valid log-likelihood: -2.327550 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.791429 (seconds)
+epoch: 25 - Train loss: 670.525024 - Valid log-likelihood: -2.327632 - <<DAGness>>: 0.000000 - Elapsed time per epoch 18.603045 (seconds)
+epoch: 26 - Train loss: 26.590384 - Valid log-likelihood: -2.327821 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.871339 (seconds)
+epoch: 26 - Train loss: 245.746460 - Valid log-likelihood: -2.328153 - <<DAGness>>: 0.000000 - Elapsed time per epoch 6.823961 (seconds)
+epoch: 26 - Train loss: 462.873413 - Valid log-likelihood: -2.327513 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.611354 (seconds)
+epoch: 26 - Train loss: 680.651978 - Valid log-likelihood: -2.327612 - <<DAGness>>: 0.000000 - Elapsed time per epoch 18.611270 (seconds)
+epoch: 27 - Train loss: 36.555073 - Valid log-likelihood: -2.327951 - <<DAGness>>: 0.000000 - Elapsed time per epoch 1.116217 (seconds)
+epoch: 27 - Train loss: 253.278336 - Valid log-likelihood: -2.327805 - <<DAGness>>: 0.000000 - Elapsed time per epoch 7.168968 (seconds)
+epoch: 27 - Train loss: 471.314606 - Valid log-likelihood: -2.327699 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.490511 (seconds)
+epoch: 27 - Train loss: 689.641846 - Valid log-likelihood: -2.327349 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.445658 (seconds)
+epoch: 28 - Train loss: 46.130306 - Valid log-likelihood: -2.327547 - <<DAGness>>: 0.000000 - Elapsed time per epoch 1.352465 (seconds)
+epoch: 28 - Train loss: 264.832947 - Valid log-likelihood: -2.327588 - <<DAGness>>: 0.000000 - Elapsed time per epoch 7.369558 (seconds)
+epoch: 28 - Train loss: 482.415527 - Valid log-likelihood: -2.327513 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.112858 (seconds)
+epoch: 28 - Train loss: 699.813416 - Valid log-likelihood: -2.327256 - <<DAGness>>: 0.000000 - Elapsed time per epoch 18.946443 (seconds)
+------- New best validation loss --------
+++ epoch: 28 - Train loss: 699.813416 - Valid log-likelihood: -2.327256 - <<DAGness>>: 0.000000 - Elapsed time per epoch 18.946443 (seconds)
+# 45000 e28: i9790 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e28: i9790 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.         -0.02594535]
+ [ 1.         -0.03024869]]
+# 45000 ++ e28: i9790 - lambda_ate = [-0.00430], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 29 - Train loss: 56.598316 - Valid log-likelihood: -2.328097 - <<DAGness>>: 0.000000 - Elapsed time per epoch 1.640181 (seconds)
+epoch: 29 - Train loss: 274.313019 - Valid log-likelihood: -2.327476 - <<DAGness>>: 0.000000 - Elapsed time per epoch 7.566069 (seconds)
+epoch: 29 - Train loss: 491.414703 - Valid log-likelihood: -2.327564 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.446750 (seconds)
+epoch: 29 - Train loss: 709.322571 - Valid log-likelihood: -2.327746 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.432739 (seconds)
+epoch: 30 - Train loss: 65.218010 - Valid log-likelihood: -2.327483 - <<DAGness>>: 0.000000 - Elapsed time per epoch 1.931175 (seconds)
+epoch: 30 - Train loss: 284.445160 - Valid log-likelihood: -2.327505 - <<DAGness>>: 0.000000 - Elapsed time per epoch 7.855740 (seconds)
+epoch: 30 - Train loss: 501.851440 - Valid log-likelihood: -2.327516 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.754393 (seconds)
+epoch: 30 - Train loss: 718.703308 - Valid log-likelihood: -2.327540 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.628487 (seconds)
+epoch: 31 - Train loss: 75.307999 - Valid log-likelihood: -2.327499 - <<DAGness>>: 0.000000 - Elapsed time per epoch 2.163645 (seconds)
+epoch: 31 - Train loss: 294.711975 - Valid log-likelihood: -2.327518 - <<DAGness>>: 0.000000 - Elapsed time per epoch 8.215590 (seconds)
+epoch: 31 - Train loss: 511.629333 - Valid log-likelihood: -2.328029 - <<DAGness>>: 0.000000 - Elapsed time per epoch 14.066043 (seconds)
+epoch: 31 - Train loss: 729.356628 - Valid log-likelihood: -2.327548 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.936354 (seconds)
+epoch: 32 - Train loss: 85.712784 - Valid log-likelihood: -2.327709 - <<DAGness>>: 0.000000 - Elapsed time per epoch 2.413949 (seconds)
+epoch: 32 - Train loss: 304.820953 - Valid log-likelihood: -2.327753 - <<DAGness>>: 0.000000 - Elapsed time per epoch 8.363476 (seconds)
+epoch: 32 - Train loss: 520.943054 - Valid log-likelihood: -2.327382 - <<DAGness>>: 0.000000 - Elapsed time per epoch 14.305239 (seconds)
+epoch: 32 - Train loss: 738.802246 - Valid log-likelihood: -2.327887 - <<DAGness>>: 0.000000 - Elapsed time per epoch 20.191504 (seconds)
+epoch: 33 - Train loss: 94.960030 - Valid log-likelihood: -2.327569 - <<DAGness>>: 0.000000 - Elapsed time per epoch 2.668553 (seconds)
+epoch: 33 - Train loss: 310.830109 - Valid log-likelihood: -2.327782 - <<DAGness>>: 0.000000 - Elapsed time per epoch 8.581554 (seconds)
+epoch: 33 - Train loss: 528.439453 - Valid log-likelihood: -2.327693 - <<DAGness>>: 0.000000 - Elapsed time per epoch 14.569226 (seconds)
+epoch: 33 - Train loss: 747.472900 - Valid log-likelihood: -2.327958 - <<DAGness>>: 0.000000 - Elapsed time per epoch 20.569154 (seconds)
+epoch: 34 - Train loss: 105.263718 - Valid log-likelihood: -2.327630 - <<DAGness>>: 0.000000 - Elapsed time per epoch 2.882418 (seconds)
+epoch: 34 - Train loss: 322.977783 - Valid log-likelihood: -2.327627 - <<DAGness>>: 0.000000 - Elapsed time per epoch 8.799458 (seconds)
+epoch: 34 - Train loss: 541.276123 - Valid log-likelihood: -2.327513 - <<DAGness>>: 0.000000 - Elapsed time per epoch 14.802301 (seconds)
+epoch: 34 - Train loss: 757.749146 - Valid log-likelihood: -2.327457 - <<DAGness>>: 0.000000 - Elapsed time per epoch 20.720784 (seconds)
+epoch: 35 - Train loss: 114.453148 - Valid log-likelihood: -2.327627 - <<DAGness>>: 0.000000 - Elapsed time per epoch 3.338659 (seconds)
+epoch: 35 - Train loss: 332.164948 - Valid log-likelihood: -2.327701 - <<DAGness>>: 0.000000 - Elapsed time per epoch 9.731900 (seconds)
+epoch: 35 - Train loss: 549.872009 - Valid log-likelihood: -2.327765 - <<DAGness>>: 0.000000 - Elapsed time per epoch 15.821448 (seconds)
+epoch: 35 - Train loss: 767.492493 - Valid log-likelihood: -2.327440 - <<DAGness>>: 0.000000 - Elapsed time per epoch 21.691141 (seconds)
+epoch: 36 - Train loss: 124.934654 - Valid log-likelihood: -2.327352 - <<DAGness>>: 0.000000 - Elapsed time per epoch 4.162983 (seconds)
+epoch: 36 - Train loss: 343.528748 - Valid log-likelihood: -2.327868 - <<DAGness>>: 0.000000 - Elapsed time per epoch 11.690792 (seconds)
+epoch: 36 - Train loss: 560.628906 - Valid log-likelihood: -2.327453 - <<DAGness>>: 0.000000 - Elapsed time per epoch 18.783732 (seconds)
+epoch: 36 - Train loss: 778.535706 - Valid log-likelihood: -2.327772 - <<DAGness>>: 0.000000 - Elapsed time per epoch 24.949412 (seconds)
+epoch: 37 - Train loss: 134.796051 - Valid log-likelihood: -2.327524 - <<DAGness>>: 0.000000 - Elapsed time per epoch 3.824742 (seconds)
+epoch: 37 - Train loss: 351.874573 - Valid log-likelihood: -2.327572 - <<DAGness>>: 0.000000 - Elapsed time per epoch 9.812859 (seconds)
+epoch: 37 - Train loss: 570.143982 - Valid log-likelihood: -2.327325 - <<DAGness>>: 0.000000 - Elapsed time per epoch 16.542461 (seconds)
+epoch: 37 - Train loss: 787.739014 - Valid log-likelihood: -2.327694 - <<DAGness>>: 0.000000 - Elapsed time per epoch 22.421098 (seconds)
+epoch: 38 - Train loss: 143.256302 - Valid log-likelihood: -2.327839 - <<DAGness>>: 0.000000 - Elapsed time per epoch 3.952704 (seconds)
+epoch: 38 - Train loss: 361.327789 - Valid log-likelihood: -2.327815 - <<DAGness>>: 0.000000 - Elapsed time per epoch 9.783814 (seconds)
+epoch: 38 - Train loss: 578.887695 - Valid log-likelihood: -2.327568 - <<DAGness>>: 0.000000 - Elapsed time per epoch 15.558935 (seconds)
+epoch: 38 - Train loss: 797.352783 - Valid log-likelihood: -2.327988 - <<DAGness>>: 0.000000 - Elapsed time per epoch 21.440529 (seconds)
+epoch: 39 - Train loss: 154.209549 - Valid log-likelihood: -2.327746 - <<DAGness>>: 0.000000 - Elapsed time per epoch 4.189888 (seconds)
+epoch: 39 - Train loss: 371.549042 - Valid log-likelihood: -2.327468 - <<DAGness>>: 0.000000 - Elapsed time per epoch 9.990935 (seconds)
+epoch: 39 - Train loss: 589.344177 - Valid log-likelihood: -2.327416 - <<DAGness>>: 0.000000 - Elapsed time per epoch 15.863430 (seconds)
+epoch: 39 - Train loss: 807.247742 - Valid log-likelihood: -2.327540 - <<DAGness>>: 0.000000 - Elapsed time per epoch 22.560992 (seconds)
+epoch: 40 - Train loss: 163.912628 - Valid log-likelihood: -2.327715 - <<DAGness>>: 0.000000 - Elapsed time per epoch 4.481722 (seconds)
+epoch: 40 - Train loss: 383.611877 - Valid log-likelihood: -2.327423 - <<DAGness>>: 0.000000 - Elapsed time per epoch 10.427667 (seconds)
+epoch: 40 - Train loss: 599.419189 - Valid log-likelihood: -2.327587 - <<DAGness>>: 0.000000 - Elapsed time per epoch 16.487143 (seconds)
+epoch: 40 - Train loss: 817.294983 - Valid log-likelihood: -2.327760 - <<DAGness>>: 0.000000 - Elapsed time per epoch 22.496651 (seconds)
+epoch: 41 - Train loss: 173.406372 - Valid log-likelihood: -2.327714 - <<DAGness>>: 0.000000 - Elapsed time per epoch 4.960135 (seconds)
+epoch: 41 - Train loss: 391.507385 - Valid log-likelihood: -2.327367 - <<DAGness>>: 0.000000 - Elapsed time per epoch 10.812655 (seconds)
+epoch: 41 - Train loss: 609.194763 - Valid log-likelihood: -2.327600 - <<DAGness>>: 0.000000 - Elapsed time per epoch 16.947809 (seconds)
+epoch: 41 - Train loss: 826.875366 - Valid log-likelihood: -2.327559 - <<DAGness>>: 0.000000 - Elapsed time per epoch 22.952290 (seconds)
+epoch: 42 - Train loss: 183.099152 - Valid log-likelihood: -2.327764 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.537292 (seconds)
+epoch: 42 - Train loss: 400.240143 - Valid log-likelihood: -2.327787 - <<DAGness>>: 0.000000 - Elapsed time per epoch 11.305496 (seconds)
+epoch: 42 - Train loss: 617.165710 - Valid log-likelihood: -2.327711 - <<DAGness>>: 0.000000 - Elapsed time per epoch 17.838297 (seconds)
+epoch: 42 - Train loss: 836.019775 - Valid log-likelihood: -2.327604 - <<DAGness>>: 0.000000 - Elapsed time per epoch 24.270113 (seconds)
+epoch: 43 - Train loss: 192.188965 - Valid log-likelihood: -2.327993 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.447663 (seconds)
+epoch: 43 - Train loss: 409.029724 - Valid log-likelihood: -2.327507 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.397888 (seconds)
+epoch: 43 - Train loss: 626.909424 - Valid log-likelihood: -2.327559 - <<DAGness>>: 0.000000 - Elapsed time per epoch 20.562485 (seconds)
+epoch: 43 - Train loss: 845.676636 - Valid log-likelihood: -2.327747 - <<DAGness>>: 0.000000 - Elapsed time per epoch 26.463055 (seconds)
+epoch: 44 - Train loss: 202.323502 - Valid log-likelihood: -2.327330 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.455725 (seconds)
+epoch: 44 - Train loss: 419.037781 - Valid log-likelihood: -2.327486 - <<DAGness>>: 0.000000 - Elapsed time per epoch 11.454464 (seconds)
+epoch: 44 - Train loss: 638.040955 - Valid log-likelihood: -2.327696 - <<DAGness>>: 0.000000 - Elapsed time per epoch 17.437079 (seconds)
+epoch: 44 - Train loss: 855.960266 - Valid log-likelihood: -2.327580 - <<DAGness>>: 0.000000 - Elapsed time per epoch 23.448148 (seconds)
+epoch: 45 - Train loss: 211.512253 - Valid log-likelihood: -2.328147 - <<DAGness>>: 0.000000 - Elapsed time per epoch 5.836526 (seconds)
+epoch: 45 - Train loss: 430.473175 - Valid log-likelihood: -2.327227 - <<DAGness>>: 0.000000 - Elapsed time per epoch 11.660738 (seconds)
+------- New best validation loss --------
+++ epoch: 45 - Train loss: 430.473175 - Valid log-likelihood: -2.327227 - <<DAGness>>: 0.000000 - Elapsed time per epoch 11.660738 (seconds)
+# 45000 e45: i15664 - ||x_val_diff||= 0.00001, ||z_val_diff||= 0.00002, 
+e45: i15664 - ||x_val_do_diff||= 0.00001, ||z_val_do_diff||= 0.00001
+# 45000 ++ cur_x_do_n_inv_mean=
+[[ 0.        -0.0245875]
+ [ 1.        -0.0318017]]
+# 45000 ++ e45: i15664 - lambda_ate = [-0.00721], TRUE_ATE = [0.20000], beta = [-0.60000]
+epoch: 45 - Train loss: 647.785645 - Valid log-likelihood: -2.328016 - <<DAGness>>: 0.000000 - Elapsed time per epoch 41.893057 (seconds)
+epoch: 46 - Train loss: 4.902954 - Valid log-likelihood: -2.327750 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.282467 (seconds)
+epoch: 46 - Train loss: 224.237381 - Valid log-likelihood: -2.327380 - <<DAGness>>: 0.000000 - Elapsed time per epoch 6.267058 (seconds)
+epoch: 46 - Train loss: 441.151184 - Valid log-likelihood: -2.327418 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.190682 (seconds)
+epoch: 46 - Train loss: 657.847473 - Valid log-likelihood: -2.327708 - <<DAGness>>: 0.000000 - Elapsed time per epoch 17.996034 (seconds)
+epoch: 47 - Train loss: 14.701031 - Valid log-likelihood: -2.328051 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.547333 (seconds)
+epoch: 47 - Train loss: 232.639114 - Valid log-likelihood: -2.327334 - <<DAGness>>: 0.000000 - Elapsed time per epoch 6.448300 (seconds)
+epoch: 47 - Train loss: 450.351624 - Valid log-likelihood: -2.327874 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.430904 (seconds)
+epoch: 47 - Train loss: 668.055359 - Valid log-likelihood: -2.327951 - <<DAGness>>: 0.000000 - Elapsed time per epoch 18.421588 (seconds)
+epoch: 48 - Train loss: 23.979223 - Valid log-likelihood: -2.327762 - <<DAGness>>: 0.000000 - Elapsed time per epoch 0.812865 (seconds)
+epoch: 48 - Train loss: 243.014435 - Valid log-likelihood: -2.327595 - <<DAGness>>: 0.000000 - Elapsed time per epoch 6.690700 (seconds)
+epoch: 48 - Train loss: 461.166931 - Valid log-likelihood: -2.327427 - <<DAGness>>: 0.000000 - Elapsed time per epoch 12.663857 (seconds)
+epoch: 48 - Train loss: 678.107422 - Valid log-likelihood: -2.327894 - <<DAGness>>: 0.000000 - Elapsed time per epoch 18.697780 (seconds)
+epoch: 49 - Train loss: 34.048847 - Valid log-likelihood: -2.327778 - <<DAGness>>: 0.000000 - Elapsed time per epoch 1.057918 (seconds)
+epoch: 49 - Train loss: 252.908325 - Valid log-likelihood: -2.327320 - <<DAGness>>: 0.000000 - Elapsed time per epoch 6.974588 (seconds)
+epoch: 49 - Train loss: 470.466980 - Valid log-likelihood: -2.327471 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.368162 (seconds)
+epoch: 49 - Train loss: 687.093201 - Valid log-likelihood: -2.327898 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.249164 (seconds)
+epoch: 50 - Train loss: 43.860363 - Valid log-likelihood: -2.327773 - <<DAGness>>: 0.000000 - Elapsed time per epoch 1.321411 (seconds)
+epoch: 50 - Train loss: 261.373444 - Valid log-likelihood: -2.328162 - <<DAGness>>: 0.000000 - Elapsed time per epoch 7.235081 (seconds)
+epoch: 50 - Train loss: 479.825378 - Valid log-likelihood: -2.327351 - <<DAGness>>: 0.000000 - Elapsed time per epoch 13.453074 (seconds)
+epoch: 50 - Train loss: 697.617615 - Valid log-likelihood: -2.327361 - <<DAGness>>: 0.000000 - Elapsed time per epoch 19.370659 (seconds)
