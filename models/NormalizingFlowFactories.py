@@ -91,6 +91,38 @@ def buildFCNormalizingFlow_UC_conditional(nb_steps, conditioner_type, conditione
     return FCNormalizingFlow(flow_steps, ConditionalNormalLogDensity_UC(cond_dim))
 
 
+class FixedFnConditionalLogDensity_UC(nn.Module):
+    """Bivariate normal log density with per-sample rho given by a user-supplied callable.
+
+    rho_fn : callable (Tensor [B, ctx_dim]) -> Tensor [B, 1], values in (-1, 1).
+             Must operate on torch tensors and return values on the same device.
+    """
+    def __init__(self, rho_fn):
+        super().__init__()
+        self.rho_fn = rho_fn
+        self.register_buffer("log2pi", torch.tensor(2.0 * pi).log())
+
+    def forward(self, z, context):
+        rho = self.rho_fn(context)       # [B, 1]
+        z1  = z[:, 0:1]
+        z2  = z[:, 1:2]
+        det  = 1.0 - rho ** 2
+        quad = (z1 ** 2 - 2.0 * rho * z1 * z2 + z2 ** 2) / det
+        log_prob = -0.5 * (quad + det.log() + 2.0 * self.log2pi)
+        return log_prob.squeeze(1)       # [B]
+
+
+def buildFCNormalizingFlow_UC_rho_fn(nb_steps, conditioner_type, conditioner_args,
+                                     normalizer_type, normalizer_args, rho_fn):
+    """Flow whose latent log-density uses a fixed user-supplied rho_fn(context) -> rho."""
+    flow_steps = []
+    for step in range(nb_steps):
+        conditioner = conditioner_type(**conditioner_args)
+        normalizer   = normalizer_type(**normalizer_args)
+        flow_steps.append(NormalizingFlowStep(conditioner, normalizer))
+    return FCNormalizingFlow(flow_steps, FixedFnConditionalLogDensity_UC(rho_fn))
+
+
 def MNIST_A_prior(in_size, kernel):
     A = torch.zeros(in_size**2, in_size**2)
     row_pix = torch.arange(in_size).view(1, -1).expand(in_size, -1).contiguous().view(-1, 1)

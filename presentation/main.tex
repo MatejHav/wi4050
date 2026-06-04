@@ -9,6 +9,7 @@
 \usepackage{booktabs}
 \usepackage{xcolor}
 \usepackage{appendixnumberbeamer}   % keeps appendix out of total frame count
+\usepackage{graphicx}
 
 \setbeamertemplate{navigation symbols}{}
 \setbeamerfont{frametitle}{size=\normalsize,series=\bfseries}
@@ -123,16 +124,54 @@
     -
     \mathbb{E}\bigl[Y \mid \mathrm{do}(A=0)\bigr]
   \]
-  \begin{center}\itshape
-    But $U$ is unobserved — ignorability fails.\\[6pt]
-    How sensitive is $\hat\tau$ to the strength of $U$?
+  \begin{center}
+  \begin{tikzpicture}[
+    node distance=1.3cm and 2.0cm,
+    box/.style={rectangle,draw,thick,rounded corners,minimum width=1.6cm,
+                minimum height=0.65cm,font=\normalsize},
+    >=Latex,thick
+  ]
+    \node[box] (A) {$A$};
+    \node[box,right=2.2cm of A] (Y) {$Y$};
+    \node[box,above=1.2cm of A,xshift=1.1cm,draw=red,dashed,fill=red!8] (U) {$U$};
+    \draw[->] (A) -- (Y);
+    \draw[->,dashed,red,thick] (U) -- (A);
+    \draw[->,dashed,red,thick] (U) -- (Y);
+  \end{tikzpicture}
   \end{center}
-  \medskip
-  \begin{enumerate}
-    \item Fix scalar confounding strength $\rho$
-    \item Estimate $\hat\tau(\rho)$
-    \item Report full $\rho$-curve; let domain knowledge bound $\rho$
-  \end{enumerate}
+  \begin{center}\itshape
+    $U$ unobserved. How sensitive is $\hat\tau$ to $U$?
+  \end{center}
+\end{frame}
+
+% ── 4b. Noise Variables and Latent Correlation ────────────────────────────────
+\begin{frame}{Confounding as Latent Correlation}
+  \textit{After removing $A\!\to\!Y$, residual noise may still correlate.}
+  \begin{center}
+  \begin{tikzpicture}[
+    node distance=1.3cm and 2.4cm,
+    circ/.style={circle,draw,thick,minimum size=0.9cm,font=\normalsize},
+    box/.style={rectangle,draw,thick,rounded corners,minimum width=2.0cm,
+                minimum height=0.65cm,font=\normalsize},
+    >=Latex,thick
+  ]
+    \node[circ] (zA) {$z_A$};
+    \node[circ,right=2.6cm of zA] (zY) {$z_Y$};
+    \node[box,below=1.3cm of zA] (A) {$A\in\{0,1\}$};
+    \node[box,below=1.3cm of zY] (Y) {$Y$};
+    \draw[<->,blue,thick,dashed] (zA) -- (zY)
+          node[midway,above,draw=none,blue] {$\mathrm{corr}=\;?$};
+    \draw[->] (zA) -- (A)
+          node[midway,left,draw=none,font=\small] {$f_A^{-1}$};
+    \draw[->] (zY) -- (Y)
+          node[midway,right,draw=none,font=\small] {$f_Y^{-1}$};
+    \draw[->] (A) -- (Y)
+          node[midway,below,draw=none] {$\tau$};
+  \end{tikzpicture}
+  \end{center}
+  \begin{center}\itshape
+    Correlation between $z_A$ and $z_Y$ encodes unobserved $U$.
+  \end{center}
 \end{frame}
 
 % =============================================================================
@@ -141,7 +180,7 @@
 
 % ── 5. Gaussian Copula as ρ ───────────────────────────────────────────────────
 \begin{frame}{Gaussian Copula as Sensitivity Parameter}
-  \textit{Unobserved confounding $\equiv$ latent Gaussian correlation $\rho$.}
+  \textit{Model $\mathrm{corr}(z_A,z_Y)=\rho$ via a Gaussian copula. True $\rho$ is never identified.}
   \[
     C_\rho(u,v) \;=\; \Phi_\rho\!\bigl(\Phi^{-1}(u),\;\Phi^{-1}(v)\bigr)
   \]
@@ -182,27 +221,25 @@
       p(A,Y) \;=\; p_Z\!\bigl(f(A,Y)\bigr)\,\bigl|\det J_f\bigr|
     \]
     \smallskip
-    $f_\theta$ learned end-to-end via max.\ likelihood\\[4pt]
-    \textcolor{gray}{\small(architecture details: backup slides)}
+    $f_\theta$ learned end-to-end via max.\ likelihood
   \end{columns}
 \end{frame}
 
 % ── 7. ATE Estimator ─────────────────────────────────────────────────────────
 \begin{frame}{ATE Estimator via Flow Inversion}
-  \textit{Pin $z_A$; invert; read off $Y$. Average over noise draws.}
+  \textit{Set $A$ in data space; draw $z_Y$ from the correlated prior.}
   \[
     \hat\tau
     \;=\; \frac{1}{S}\sum_{s=1}^{S}
     \Bigl[
-      \bigl[f^{-1}(\mathbf{z}^{(s)},\; z_A{=}1)\bigr]_Y
+      \bigl[f^{-1}(\mathbf{z}^{(s)},\; A{=}1)\bigr]_Y
       \;-\;
-      \bigl[f^{-1}(\mathbf{z}^{(s)},\; z_A{=}0)\bigr]_Y
+      \bigl[f^{-1}(\mathbf{z}^{(s)},\; A{=}0)\bigr]_Y
     \Bigr]
   \]
   \[
     (z_A^{(s)},\; z_Y^{(s)}) \;\sim\; \mathcal{N}(\mathbf{0},\;\Sigma_\rho)
   \]
-  Do-intervention in latent space; propagated through $f^{-1}$.
 \end{frame}
 
 % =============================================================================
@@ -227,19 +264,8 @@
 \begin{frame}{Setting 0: Results}
   \textit{Minimum RMSE at assumed $\rho \approx \rho^*$. Model is identifiable.}
   \begin{center}
-  \renewcommand{\arraystretch}{1.25}
-  \begin{tabular}{rcc}
-    \toprule
-    Assumed $\rho$ & Mean $\hat\tau$ & RMSE \\
-    \midrule
-    $0.156$ & $0.343$ & $0.149$ \\
-    $\mathbf{0.261}$ & $\mathbf{0.228}$ & $\mathbf{0.044}$ \\
-    $0.365$ & $0.109$ & $0.096$ \\
-    \bottomrule
-  \end{tabular}
+    \includegraphics[width=0.92\textwidth]{../figures/setting0_rho_curve.png}
   \end{center}
-  \medskip
-  $n = 5000$, $5$ seeds. True ATE $= 0.20$,\; $\rho^* = 0.30$.
 \end{frame}
 
 % ── 10. Setting 1: Clayton DGP ────────────────────────────────────────────────
@@ -247,13 +273,13 @@
   \textit{True copula has lower-tail dependence; Gaussian model is wrong.}
   \[
     C_\theta(u,v) \;=\; \bigl(u^{-\theta}+v^{-\theta}-1\bigr)^{-1/\theta},
-    \qquad \lambda_L = 2^{-1/\theta}
+    \qquad \theta = 2,\quad \lambda_L = 2^{-1/\theta}
   \]
   \[
-    \tau_K = \frac{\theta}{\theta+2}\;,
-    \qquad
-    \rho_{\mathrm{ref}} = \sin\!\left(\frac{\pi\,\tau_K}{2}\right)
-    \approx 0.707 \quad(\theta = 2)
+    \rho_{\mathrm{ref}}
+      = \sin\!\left(\frac{\pi}{2}\cdot\frac{\theta}{\theta+2}\right)
+      \approx 0.707,
+    \qquad \text{True ATE} = 0.20
   \]
 \end{frame}
 
@@ -261,93 +287,114 @@
 \begin{frame}{Setting 1: Results}
   \textit{Copula mismatch shifts optimal $\rho$ and inflates RMSE.}
   \begin{center}
-  \renewcommand{\arraystretch}{1.25}
-  \begin{tabular}{rcc}
-    \toprule
-    Assumed $\rho$ & Mean $\hat\tau$ & RMSE \\
-    \midrule
-    $\rho_{\mathrm{ref}} = 0.707$ & $-0.038$ & $0.240$ \\
-    $\bm{\rho_{\mathrm{opt}} = 0.550}$ & $\mathbf{0.216}$ & $\mathbf{0.053}$ \\
-    \bottomrule
-  \end{tabular}
+    \includegraphics[width=0.92\textwidth]{../figures/setting1_rho_curve.png}
   \end{center}
-  \medskip
-  RMSE at $\rho_{\mathrm{ref}}$ is $\mathbf{4.5\times}$ higher than at $\rho_{\mathrm{opt}}$.
-  True ATE $= 0.20$.
 \end{frame}
 
-% =============================================================================
-\section{Limitations}
-% =============================================================================
-
-% ── 12. Limitation 1: Gaussian Copula Assumption ─────────────────────────────
-\begin{frame}{Limitation 1: Gaussian Copula Is a Strong Assumption}
-  \textit{All confounding is forced into a Gaussian shape — regardless of reality.}
+% ── 12. Why Did Setting 1 Fail? ──────────────────────────────────────────────
+\begin{frame}{Why Did Setting 1 Fail?}
+  \textit{Gaussian shape forced for every DGP.}
   \[
     (z_A,z_Y)\sim\mathcal{N}(\mathbf{0},\Sigma_\rho)
-    \quad\text{for \emph{every} dataset, \emph{every} DGP}
+    \quad\text{for \emph{every} dataset}
   \]
   \begin{itemize}
-    \item Clayton tail dependence $\neq$ Gaussian tail dependence
-    \item Optimal $\rho$ shifts away from the Kendall-matched $\rho_{\mathrm{ref}}$
-    \item Model \emph{compensates} with a wrong $\rho$, not a correct copula
+    \item No tail dependence: Clayton has $\lambda_L > 0$, Gaussian has $\lambda_L = 0$
+    \item Optimal $\rho$ shifts away from $\rho_{\mathrm{ref}}$ under misspecification
   \end{itemize}
 \end{frame}
 
-% ── 13. Limitation 2: ρ Cannot Depend on Observed Covariates ─────────────────
-\begin{frame}{Limitation 2: $\rho$ Is Blind to Observed Covariates}
-  \textit{$\rho$ is one global constant — it cannot vary with $X$.}
-  \begin{columns}[c]
-    \column{0.5\textwidth}
-    \[
-      (z_A,z_Y)\sim\mathcal{N}(\mathbf{0},\Sigma_{\textcolor{red}{\rho}})
-    \]
-    Same $\rho$ for all observations,\\
-    even when confounding strength\\
-    clearly varies across subgroups.
-    \column{0.5\textwidth}
-    \textbf{Example:} Clayton $\theta(X) = 0.5 + 3.5\,X$
-    \[
-      X\!\to\!0:\;\text{weak confounding}
-    \]
-    \[
-      X\!\to\!1:\;\text{strong confounding}
-    \]
-    Original $\rho$-GNF has no mechanism\\
-    to use $X$ when estimating $\hat\tau$.
-  \end{columns}
+% ── 13. A Harder Problem: Heterogeneous Confounding ──────────────────────────
+\begin{frame}{A Harder Problem: Heterogeneous Confounding}
+  \[
+    (z_{A,i},\,z_{Y,i})\;\sim\;\mathcal{N}\!\left(\mathbf{0},\;\Sigma_{\textcolor{red}{\rho}}\right)
+    \quad \forall\; i
+  \]
+  \begin{center}\itshape
+    Same copula, same $\rho$, for every observation.
+  \end{center}
+  \bigskip
+  \pause
+  \begin{center}\itshape
+    With many features, homogeneous confounding is almost guaranteed to break.
+  \end{center}
 \end{frame}
 
 % =============================================================================
 \section{Extension}
 % =============================================================================
 
+% ── 13b. Motivation: Per-Category Setup ──────────────────────────────────────
+\begin{frame}{Motivation: One Model Per Category}
+  \textit{For discrete $X$: run the setup separately for each group.}
+  \begin{columns}[c]
+    \column{0.5\textwidth}
+    \centering\textbf{$X = \text{low}$}\\[10pt]
+    \[
+      (z_A,z_Y)\sim\mathcal{N}\!\left(\mathbf{0},\Sigma_{\rho_{\text{low}}}\right)
+    \]
+    \centering weak confounding
+
+    \column{0.5\textwidth}
+    \centering\textbf{$X = \text{high}$}\\[10pt]
+    \[
+      (z_A,z_Y)\sim\mathcal{N}\!\left(\mathbf{0},\Sigma_{\rho_{\text{high}}}\right)
+    \]
+    \centering strong confounding
+  \end{columns}
+  \medskip
+  \begin{center}\itshape
+    V2 generalises this: feed $X$ as context to a single flow.
+  \end{center}
+\end{frame}
+
 % ── 14. Extension: Context Conditioning ──────────────────────────────────────
 \begin{frame}{Extension: Context Conditioning}
-  \textit{DGP: $\theta(X) \in [0.5,\,4]$ with $X \sim U[0,1]$. Can the model adapt?}
+  \textit{\textbf{V1}: no context \quad \textbf{V2}: condition on $X$}
+  \begin{center}
+    \includegraphics[width=0.95\textwidth]{../figures/setting2_comparison.png}
+  \end{center}
+  V1 and V2 nearly identical: context conditioning does not fix the copula.
+\end{frame}
+
+% ── 15. Further Extension: ρ(X) Conditional Copula ──────────────────────────
+\begin{frame}{Further Extension: Covariate-Dependent Copula}
+  \textit{V2 fixes the copula; V3 learns $\rho(X)$.}
   \begin{columns}[c]
-    \column{0.48\textwidth}
-    \textbf{V1} — fixed $\rho$, no context:
+    \column{0.46\textwidth}
+    \centering\textbf{V2}\\[8pt]
+    $\rho$ global; $X$ in flow only.
     \[
-      h_i = \mathrm{MLP}(e_i)
+      z\sim\mathcal{N}\!\left(\mathbf{0},\,\Sigma_{\textcolor{red}{\rho}}\right)
     \]
 
-    \textbf{V2} — condition on $X$:
+    \column{0.54\textwidth}
+    \centering\textbf{V3}\\[8pt]
     \[
-      h_i = \mathrm{MLP}(e_i \;\|\; X)
+      \rho(X) = \tanh\!\bigl(\mathrm{MLP}(X)\bigr)
     \]
-
-    \column{0.52\textwidth}
-    \begin{center}
-    \fbox{%
-      \parbox{3.6cm}{\centering
-        \vspace{1.0cm}
-        {\small\itshape Setting 2 results\\[4pt]pending}
-        \vspace{1.0cm}
-      }%
-    }
-    \end{center}
+    \[
+      z\sim\mathcal{N}\!\left(\mathbf{0},\,\Sigma_{\textcolor{blue}{\rho(X)}}\right)
+    \]
   \end{columns}
+  \medskip
+  \begin{center}\itshape
+    Practitioner specifies a function, not a scalar. Models heterogeneous confounding.
+  \end{center}
+\end{frame}
+
+% ── 16. Conclusion ───────────────────────────────────────────────────────────
+\begin{frame}{Conclusion}
+  \setbeamercovered{transparent}
+  \begin{itemize}[<+->]
+    \item Use $\rho$-GNF to bound ATE sensitivity to confounding.
+    \item Works when the Gaussian copula assumption holds.
+    \item Assumptions are strong; require expert knowledge to argue.
+    \item Not robust to copula misspecification (Setting~1).
+    \item Extended the flow to condition on $X$ (V2).
+    \item V2 relaxes the homogeneous-confounding assumption.
+    \item \alert{But shifts more uncheckable work to the practitioner.}
+  \end{itemize}
 \end{frame}
 
 % ── Q&A ──────────────────────────────────────────────────────────────────────
@@ -364,7 +411,7 @@
 % =============================================================================
 \appendix
 
-\begin{frame}{Backup: DAGConditioner — Encoding Causal Order}
+\begin{frame}{Backup: DAGConditioner (Causal Order Encoding)}
   \textit{Mask $M$ ensures $h_i$ sees only causal parents.}
   \[
     h_i \;=\; \mathrm{MLP}\!\bigl(M_{i,:} \odot x\bigr),
@@ -376,10 +423,10 @@
     \qquad
     h_Y = \mathrm{MLP}(A)
   \]
-  Adjacency $A_\theta$ trained via Gumbel-softmax; $\ell_1$ sparsity.
+  Graph $A \to Y$ is fixed; only flow weights $\theta$ are trained.
 \end{frame}
 
-\begin{frame}{Backup: UMNN — Unconstrained Monotone Neural Network}
+\begin{frame}{Backup: UMNN (Unconstrained Monotone Neural Network)}
   \textit{Each variable maps through a strictly monotone bijection.}
   \[
     z_i \;=\; \int_0^{x_i} g_\phi\!\bigl(t;\; h_i\bigr)\;\mathrm{d}t \;+\; b_i,

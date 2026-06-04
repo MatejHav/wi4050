@@ -18,7 +18,11 @@ from torch.distributions.multivariate_normal import MultivariateNormal
 
 from models.Normalizers import MonotonicNormalizer
 from models.Conditionners import DAGConditioner
-from models.NormalizingFlowFactories import buildFCNormalizingFlow_UC
+from models.NormalizingFlowFactories import (
+    buildFCNormalizingFlow_UC,
+    buildFCNormalizingFlow_UC_rho_fn,
+    FixedFnConditionalLogDensity_UC,
+)
 
 
 # ── Causal graph helpers ─────────────────────────────────────────────────────
@@ -57,7 +61,7 @@ def compute_normalisation(data_train, data_val):
 
 def build_rho_gnf(Z_Sigma, emb_net, int_net, nb_steps, solver, l1,
                   nb_flow, data_mu, data_sigma, nb_epoch_update, device,
-                  cond_in=0):
+                  cond_in=0, cat_dims=None):
     """
     Build a rho-GNF (DAGConditioner + MonotonicNormalizer) for a 2-variable system.
 
@@ -101,7 +105,7 @@ def build_rho_gnf(Z_Sigma, emb_net, int_net, nb_steps, solver, l1,
         "solver":        solver,
         "mu":            data_mu.to(device),
         "sigma":         data_sigma.to(device),
-        "cat_dims":      None,
+        "cat_dims":      cat_dims,
     }
     model = buildFCNormalizingFlow_UC(
         nb_flow, DAGConditioner, conditioner_args,
@@ -120,11 +124,65 @@ def build_rho_gnf(Z_Sigma, emb_net, int_net, nb_steps, solver, l1,
     return model
 
 
+def build_rho_fn_gnf(rho_fn, emb_net, int_net, nb_steps, solver, l1,
+                     nb_flow, data_mu, data_sigma, nb_epoch_update, device,
+                     cat_dims=None):
+    """
+    Build a rho-GNF whose latent log-density uses rho_fn(X_col) instead of a fixed rho.
+
+    rho_fn  : callable (Tensor [B, 1]) -> Tensor [B, 1], values in (-1, 1).
+              Receives the X column extracted from each training batch.
+
+    During training, pass rho_x_col=<column_index> to train_model so that X is
+    extracted from each batch and forwarded to the log-density.
+
+    The DAGConditioner's Z_Sigma is set to identity — it is only used internally
+    for the DAG constraint machinery; the actual NLL uses rho_fn.
+    """
+    dim = 2
+    conditioner_args = {
+        "in_size":          dim,
+        "hidden":           emb_net[:-1],
+        "out_size":         emb_net[-1],
+        "l1":               l1,
+        "gumble_T":         0.5,
+        "nb_epoch_update":  nb_epoch_update,
+        "hot_encoding":     False,
+        "A_prior":          get_adj_matrix().to(device),
+        "Z_Sigma":          torch.eye(dim).to(device),
+        "cond_in":          0,
+    }
+    normalizer_args = {
+        "integrand_net": int_net,
+        "cond_size":     emb_net[-1],
+        "nb_steps":      nb_steps,
+        "solver":        solver,
+        "mu":            data_mu.to(device),
+        "sigma":         data_sigma.to(device),
+        "cat_dims":      cat_dims,
+    }
+    model = buildFCNormalizingFlow_UC_rho_fn(
+        nb_flow, DAGConditioner, conditioner_args,
+        MonotonicNormalizer, normalizer_args,
+        rho_fn=rho_fn,
+    )
+    model = model.to(device)
+
+    for cond in model.getConditioners():
+        cond.dag_const     = torch.tensor(0.)
+        cond.l1_weight     = torch.tensor(0.)
+        cond.is_invertible = True
+
+    return model
+
+
 # ── Training ─────────────────────────────────────────────────────────────────
 
 def train_model(model, data_train, data_val,
                 nb_epoch, b_size, nb_steps, learning_rate, nb_estop, device,
-                context_train=None, context_val=None):
+                context_train=None, context_val=None,
+                rho_x_col=None,
+                rho_context_train=None, rho_context_val=None):
     """
     Train a rho-GNF. Returns (trained_model, val_loss_history).
 
@@ -134,32 +192,40 @@ def train_model(model, data_train, data_val,
 
     If context_train / context_val are provided (shape [N, ctx_dim]), they are
     passed as conditioning context to the model on every forward call (V2 variant).
+
+    If rho_x_col is set to a column index, that column is extracted from the data
+    batch and passed as context to model.loss / z_log_density.  Use this with
+    build_rho_fn_gnf so the fixed rho_fn receives the treatment variable X.
+
+    If rho_context_train / rho_context_val are provided (shape [N, ctx_dim]),
+    they are passed directly to model.loss as the rho context, independently of
+    the model data.  Use this when the confounder X is not a column of the model
+    data (e.g. data is (A, Y) but X must be supplied separately for rho_fn).
+    rho_context takes priority over rho_x_col when both are set.
     """
     workers = 0 if platform.system() == "Windows" else 4
-    has_ctx = context_train is not None
+    has_ctx     = context_train is not None
+    has_rho_ext = rho_context_train is not None
 
-    if has_ctx:
-        l_trn = DataLoader(
-            TensorDataset(data_train.float(), context_train.float()),
-            batch_size=b_size, shuffle=True,
+    def _make_loader(tensors, batch_size, shuffle):
+        return DataLoader(
+            TensorDataset(*[t.float() for t in tensors]),
+            batch_size=batch_size, shuffle=shuffle,
             num_workers=workers, drop_last=False,
         )
-        l_val = DataLoader(
-            TensorDataset(data_val.float(), context_val.float()),
-            batch_size=len(data_val), shuffle=False,
-            num_workers=workers, drop_last=False,
-        )
+
+    if has_ctx and has_rho_ext:
+        l_trn = _make_loader([data_train, context_train, rho_context_train], b_size, True)
+        l_val = _make_loader([data_val,   context_val,   rho_context_val],   len(data_val), False)
+    elif has_ctx:
+        l_trn = _make_loader([data_train, context_train], b_size, True)
+        l_val = _make_loader([data_val,   context_val],   len(data_val), False)
+    elif has_rho_ext:
+        l_trn = _make_loader([data_train, rho_context_train], b_size, True)
+        l_val = _make_loader([data_val,   rho_context_val],   len(data_val), False)
     else:
-        l_trn = DataLoader(
-            TensorDataset(data_train.float()),
-            batch_size=b_size, shuffle=True,
-            num_workers=workers, drop_last=False,
-        )
-        l_val = DataLoader(
-            TensorDataset(data_val.float()),
-            batch_size=len(data_val), shuffle=False,
-            num_workers=workers, drop_last=False,
-        )
+        l_trn = _make_loader([data_train], b_size, True)
+        l_val = _make_loader([data_val],   len(data_val), False)
 
     opt = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -180,15 +246,32 @@ def train_model(model, data_train, data_val,
 
         ll_tot = 0.
         for i, batch in enumerate(l_trn):
-            cur_x   = batch[0].to(device)
-            cur_ctx = batch[1].to(device) if has_ctx else None
+            if has_ctx and has_rho_ext:
+                cur_x, cur_ctx, cur_rho_ext = [b.to(device) for b in batch]
+            elif has_ctx:
+                cur_x, cur_ctx = batch[0].to(device), batch[1].to(device)
+                cur_rho_ext = None
+            elif has_rho_ext:
+                cur_x, cur_rho_ext = batch[0].to(device), batch[1].to(device)
+                cur_ctx = None
+            else:
+                cur_x = batch[0].to(device)
+                cur_ctx, cur_rho_ext = None, None
 
             # Randomise integration steps slightly (matches original)
             for norm in model.getNormalizers():
                 norm.nb_steps = nb_steps + torch.randint(0, 10, [1]).item()
 
             z, jac = model(cur_x, context=cur_ctx)
-            loss = model.loss(z, jac)
+
+            if has_rho_ext:
+                rho_ctx = cur_rho_ext
+            elif rho_x_col is not None:
+                rho_ctx = cur_x[:, rho_x_col:rho_x_col+1]
+            else:
+                rho_ctx = None
+
+            loss = model.loss(z, jac, context=rho_ctx)
 
             if math.isnan(loss.item()) or math.isinf(loss.abs().item()):
                 print(f"  [epoch {epoch}] NaN/Inf loss — stopping run.")
@@ -210,10 +293,31 @@ def train_model(model, data_train, data_val,
                 norm.nb_steps = nb_steps + 20
             ll_val = 0.
             for i, batch in enumerate(l_val):
-                cur_x   = batch[0].to(device)
-                cur_ctx = batch[1].to(device) if has_ctx else None
+                if has_ctx and has_rho_ext:
+                    cur_x, cur_ctx, cur_rho_ext = [b.to(device) for b in batch]
+                elif has_ctx:
+                    cur_x, cur_ctx = batch[0].to(device), batch[1].to(device)
+                    cur_rho_ext = None
+                elif has_rho_ext:
+                    cur_x, cur_rho_ext = batch[0].to(device), batch[1].to(device)
+                    cur_ctx = None
+                else:
+                    cur_x = batch[0].to(device)
+                    cur_ctx, cur_rho_ext = None, None
+
                 z, jac = model(cur_x, context=cur_ctx)
-                ll_val += (model.z_log_density(z) + jac).mean().item()
+
+                if has_rho_ext:
+                    rho_ctx_val = cur_rho_ext
+                elif rho_x_col is not None:
+                    rho_ctx_val = cur_x[:, rho_x_col:rho_x_col+1]
+                else:
+                    rho_ctx_val = None
+
+                if rho_ctx_val is not None:
+                    ll_val += (model.z_log_density(z, rho_ctx_val) + jac).mean().item()
+                else:
+                    ll_val += (model.z_log_density(z) + jac).mean().item()
             ll_val /= i + 1
 
         neg_ll_val = -ll_val
