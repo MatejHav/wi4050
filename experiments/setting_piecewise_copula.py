@@ -26,11 +26,11 @@ are drawn from their joint (BivariateNormal with rho(X)), and A is set to a:
 Experiment
 ----------
 The rho-GNF model is trained on (A, Y) pairs with X supplied as external
-rho context.  Three variants are compared:
+rho context.  Two variants are compared:
 
-  - rho_fn (correct) : piecewise rho(X)  -> recovers TRUE_ATE
-  - fixed rho = avg  : constant rho      -> biased ATE
-  - fixed rho = 0    : no correlation    -> biased ATE
+  - split rho (oracle): two fixed-rho models on X<0 / X>=0 subsets -> recovers TRUE_ATE
+  - fixed rho = avg   : constant rho=0.15                          -> biased ATE
+  - fixed rho = 0     : no correlation                             -> biased ATE
 
 Output
 ------
@@ -46,7 +46,6 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from pathlib import Path
-from scipy.special import expit as sigmoid
 
 from experiments.utils import (
     get_cov_matrix,
@@ -63,7 +62,7 @@ RHO_NEG  = -0.5   # copula rho between Z_A and Z_Y when X < 0
 RHO_POS  =  0.8   # copula rho between Z_A and Z_Y when X >= 0
 RHO_AVG  = (RHO_NEG + RHO_POS) / 2.0   # = 0.15
 
-TRUE_ATE = 1.0    # structural coefficient of A in Y = Z_Y + TRUE_ATE * A
+TRUE_ATE = 1 # structural coefficient of A in Y = Z_Y + TRUE_ATE * A
 
 # Reference intervention contrast (binary treatment)
 A0 = 0.0
@@ -76,8 +75,8 @@ TRUE_EY1 = TRUE_ATE   # E[Y | do(A=1)] = E[Z_Y] + TRUE_ATE*1 = TRUE_ATE
 CAT_DIMS = {0: 2}
 
 # ── Experiment parameters ─────────────────────────────────────────────────────
-N_SEEDS   = 50
-N_SAMPLES = 1_000
+N_SEEDS   = 20
+N_SAMPLES = 10_000
 
 CONFIG = dict(
     emb_net         = [20, 15, 10],
@@ -87,9 +86,9 @@ CONFIG = dict(
     nb_flow         = 1,
     l1              = 0.5,
     b_size          = 128,
-    nb_epoch        = 20,
-    learning_rate   = 3e-4,
-    nb_estop        = 20,
+    nb_epoch        = 10,
+    learning_rate   = 1e-2,
+    nb_estop        = 10,
     nb_epoch_update = 50,
     n_mce_samples   = 2_000,
     mce_b_size      = 2_000,
@@ -110,37 +109,20 @@ def rho_fn(x: torch.Tensor) -> torch.Tensor:
 # ── Data generation ───────────────────────────────────────────────────────────
 
 def generate_data(n_samples, seed):
-    """
-    Sample from the SCM.
+    """Returns FloatTensor [n_samples, 3] with columns (X, A, Y)."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
-    Returns FloatTensor [n_samples, 3] with columns (X, A, Y).
-      X ~ Uniform(-1, 1)         observed confounder
-      A ~ Bernoulli(sigmoid(X + Z_A))   binary treatment  (Z_A unobserved)
-      Y = Z_Y + TRUE_ATE * A             continuous outcome (Z_Y unobserved)
-    where (Z_A, Z_Y) | X ~ BivariateNormal(0, Sigma_rho(X)).
-    """
-    rng = np.random.default_rng(seed)
+    x   = torch.empty(n_samples, 1).uniform_(-1, 1)
+    z_a = torch.randn(n_samples, 1)
 
-    x   = rng.uniform(-1, 1, n_samples).astype(np.float32)
+    rho_x = torch.where(x < 0, torch.full_like(x, RHO_NEG), torch.full_like(x, RHO_POS))
+    z_y   = rho_x * z_a + torch.sqrt(1.0 - rho_x ** 2) * torch.randn(n_samples, 1)
 
-    # Latent noise for treatment (unobserved)
-    z_a = rng.standard_normal(n_samples).astype(np.float32)
+    a = torch.bernoulli(torch.sigmoid(x + z_a))
+    y = z_y + TRUE_ATE * a
 
-    # Latent noise for outcome via piecewise copula (unobserved)
-    # Z_Y | Z_A, X ~ N(rho(X)*Z_A, sqrt(1-rho(X)^2))
-    rho_x = np.where(x < 0, np.float32(RHO_NEG), np.float32(RHO_POS))
-    eps_y = rng.standard_normal(n_samples).astype(np.float32)
-    z_y   = rho_x * z_a + np.sqrt(np.float32(1.0) - rho_x ** 2) * eps_y
-
-    # Binary treatment: A = Bernoulli(sigmoid(X + Z_A))
-    p_a = sigmoid(x + z_a).astype(np.float32)
-    u   = rng.uniform(0, 1, n_samples).astype(np.float32)
-    a   = (u < p_a).astype(np.float32)
-
-    # Continuous outcome: Y = Z_Y + TRUE_ATE * A
-    y = z_y + np.float32(TRUE_ATE) * a
-
-    return torch.from_numpy(np.stack([x, a, y], axis=1))
+    return torch.cat([x, a, y], dim=1)
 
 
 # ── Single run helpers ────────────────────────────────────────────────────────
@@ -205,6 +187,74 @@ def run_rho_fn(seed):
     )
 
 
+def run_split_rho(seed):
+    """Train two fixed-rho models on X<0 / X>=0 subsets and return combined ATE."""
+    data_ay_train, data_ay_val, data_x_train, data_x_val, \
+        _, _, device = _prepare(seed)
+
+    mask_neg_train = data_x_train[:, 0] < 0
+    mask_pos_train = ~mask_neg_train
+    mask_neg_val   = data_x_val[:, 0] < 0
+    mask_pos_val   = ~mask_neg_val
+
+    def _train_and_estimate(ay_tr, ay_va, rho):
+        mu, sigma = compute_normalisation(ay_tr, ay_va)
+        Z_Sigma = get_cov_matrix(rho)
+        model = build_rho_gnf(
+            Z_Sigma         = Z_Sigma,
+            emb_net         = CONFIG["emb_net"],
+            int_net         = CONFIG["int_net"],
+            nb_steps        = CONFIG["nb_steps"],
+            solver          = CONFIG["solver"],
+            l1              = CONFIG["l1"],
+            nb_flow         = CONFIG["nb_flow"],
+            data_mu         = mu,
+            data_sigma      = sigma,
+            nb_epoch_update = CONFIG["nb_epoch_update"],
+            device          = device,
+            cat_dims        = CAT_DIMS,
+        )
+        model, _ = train_model(
+            model, ay_tr, ay_va,
+            nb_epoch      = CONFIG["nb_epoch"],
+            b_size        = CONFIG["b_size"],
+            nb_steps      = CONFIG["nb_steps"],
+            learning_rate = CONFIG["learning_rate"],
+            nb_estop      = CONFIG["nb_estop"],
+            device        = device,
+        )
+        # The latent z_A encoding of A=0/1 is calibrated to this stratum's P(A=1),
+        # so we must recover the actual z_A values rather than using (0.0, 1.0).
+        # z_A is a root node (no DAG parents), so any Y value gives the same z_A.
+        model.eval()
+        mean_y = float(mu[1].item())
+        with torch.no_grad():
+            z_a0, _ = model(torch.tensor([[A0, mean_y]], dtype=torch.float32, device=device))
+            z_a1, _ = model(torch.tensor([[A1, mean_y]], dtype=torch.float32, device=device))
+            tv0 = float(z_a0[0, 0].item())
+            tv1 = float(z_a1[0, 0].item())
+
+        ate = estimate_ate(
+            model,
+            Z_Sigma        = Z_Sigma,
+            n_mce_samples  = CONFIG["n_mce_samples"],
+            mce_b_size     = CONFIG["mce_b_size"],
+            device         = device,
+            treatment_dim  = 0,
+            treatment_vals = (tv0, tv1),
+        )
+        return ate, len(ay_tr) + len(ay_va)
+
+    ate_neg, n_neg = _train_and_estimate(
+        data_ay_train[mask_neg_train], data_ay_val[mask_neg_val], RHO_NEG
+    )
+    ate_pos, n_pos = _train_and_estimate(
+        data_ay_train[mask_pos_train], data_ay_val[mask_pos_val], RHO_POS
+    )
+
+    return (n_neg * ate_neg + n_pos * ate_pos) / (n_neg + n_pos)
+
+
 def run_fixed_rho(assumed_rho, seed):
     """Train with a constant assumed_rho and return ATE estimate."""
     data_ay_train, data_ay_val, _, _, \
@@ -247,9 +297,9 @@ def run_fixed_rho(assumed_rho, seed):
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
-def plot_results(est_rho_fn, est_rho_avg, est_rho0, save_path):
-    n_seeds = len(est_rho_fn)
-    fig, ax = plt.subplots(figsize=(8, 5))
+def plot_results(est_rho0, est_rho_avg, est_split, save_path):
+    n_seeds = len(est_rho0)
+    fig, ax = plt.subplots(figsize=(9, 5))
     fig.suptitle(
         f"Piecewise Copula — X confounder, A binary treatment, Y outcome\n"
         f"rho(X<0)={RHO_NEG}  rho(X>=0)={RHO_POS}  "
@@ -258,9 +308,9 @@ def plot_results(est_rho_fn, est_rho_avg, est_rho0, save_path):
     )
 
     variants = [
-        (est_rho_fn,  "rho_fn (correct)",             "steelblue",  "o"),
-        (est_rho_avg, f"fixed rho={RHO_AVG:.2f} (avg)", "darkorange", "s"),
-        (est_rho0,    "fixed rho=0",                   "purple",     "^"),
+        (est_rho0,    "fixed rho=0",                    "purple",      "^"),
+        (est_rho_avg, f"fixed rho={RHO_AVG:.2f} (avg)", "darkorange",  "s"),
+        (est_split,   "split rho (oracle)",              "forestgreen", "D"),
     ]
 
     jitter = np.linspace(-0.12, 0.12, n_seeds)
@@ -277,9 +327,9 @@ def plot_results(est_rho_fn, est_rho_avg, est_rho0, save_path):
 
     ax.set_xticks([1, 2, 3])
     ax.set_xticklabels(
-        ["rho_fn\n(correct)",
+        ["fixed rho=0\n(misspec.)",
          f"fixed rho={RHO_AVG:.2f}\n(misspec.)",
-         "fixed rho=0\n(misspec.)"],
+         "split rho\n(oracle)"],
         fontsize=9,
     )
     ax.set_ylabel("Estimated ATE  (do(A=1) - do(A=0))")
@@ -308,26 +358,25 @@ def main():
         f"  True ATE = {TRUE_ATE}  ({N_SEEDS} seeds, n={N_SAMPLES})\n"
     )
 
-    est_rho_fn  = np.zeros(N_SEEDS)
-    est_rho_avg = np.zeros(N_SEEDS)
     est_rho0    = np.zeros(N_SEEDS)
+    est_rho_avg = np.zeros(N_SEEDS)
+    est_split   = np.zeros(N_SEEDS)
 
     for s in range(N_SEEDS):
-        print(f"[seed={s}]  rho_fn", end="  ", flush=True)
-        est_rho_fn[s] = run_rho_fn(seed=s)
-        print(f"ATE={est_rho_fn[s]:+.3f}  |  "
-              f"fixed rho={RHO_AVG:.2f}", end="  ", flush=True)
-        est_rho_avg[s] = run_fixed_rho(assumed_rho=RHO_AVG, seed=s)
-        print(f"ATE={est_rho_avg[s]:+.3f}  |  fixed rho=0", end="  ", flush=True)
+        print(f"[seed={s}]  fixed rho=0", end="  ", flush=True)
         est_rho0[s] = run_fixed_rho(assumed_rho=0.0, seed=s)
-        print(f"ATE={est_rho0[s]:+.3f}", flush=True)
+        print(f"ATE={est_rho0[s]:+.3f}  |  fixed rho={RHO_AVG:.2f}", end="  ", flush=True)
+        est_rho_avg[s] = run_fixed_rho(assumed_rho=RHO_AVG, seed=s)
+        print(f"ATE={est_rho_avg[s]:+.3f}  |  split rho", end="  ", flush=True)
+        est_split[s] = run_split_rho(seed=s)
+        print(f"ATE={est_split[s]:+.3f}", flush=True)
 
     print(f"\n=== Summary  (true ATE = {TRUE_ATE}) ===")
     print(f"{'Variant':<30}  {'Mean':>8}  {'Bias':>8}  {'RMSE':>8}")
     for label, ests in [
-        ("rho_fn (correct)",               est_rho_fn),
-        (f"fixed rho={RHO_AVG:.2f} (avg)", est_rho_avg),
         ("fixed rho=0",                    est_rho0),
+        (f"fixed rho={RHO_AVG:.2f} (avg)", est_rho_avg),
+        ("split rho (oracle)",             est_split),
     ]:
         mean = float(np.mean(ests))
         bias = float(np.mean(ests - TRUE_ATE))
@@ -336,9 +385,9 @@ def main():
 
     np.savez(
         RESULTS_DIR / "results.npz",
-        est_rho_fn  = est_rho_fn,
-        est_rho_avg = est_rho_avg,
         est_rho0    = est_rho0,
+        est_rho_avg = est_rho_avg,
+        est_split   = est_split,
         true_ate    = TRUE_ATE,
         true_ey0    = TRUE_EY0,
         true_ey1    = TRUE_EY1,
@@ -350,7 +399,7 @@ def main():
     )
     print(f"Results saved -> {RESULTS_DIR / 'results.npz'}")
 
-    plot_results(est_rho_fn, est_rho_avg, est_rho0, RESULTS_DIR / "ate_figure.png")
+    plot_results(est_rho0, est_rho_avg, est_split, RESULTS_DIR / "ate_figure.png")
 
 
 if __name__ == "__main__":

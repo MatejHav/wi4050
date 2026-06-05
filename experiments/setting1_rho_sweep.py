@@ -57,8 +57,8 @@ REF_RHO    = float(np.sin(np.pi * TRUE_TAU / 2))     # ≈ 0.707
 # ── Sweep parameters ──────────────────────────────────────────────────────────
 # 20 assumed rho values from -1 to +1, excluding exact boundaries
 RHO_VALUES = np.linspace(-0.99, 0.99, 10)
-N_SEEDS    = 5
-N_SAMPLES  = 5_000
+N_SEEDS    = 20
+N_SAMPLES  = 1_000
 
 # ── Model / training config ───────────────────────────────────────────────────
 CONFIG = dict(

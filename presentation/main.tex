@@ -7,7 +7,7 @@
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning}
 \usepackage{booktabs}
-\usepackage{xcolor}
+\usepackage[dvipsnames]{xcolor}
 \usepackage{appendixnumberbeamer}   % keeps appendix out of total frame count
 \usepackage{graphicx}
 
@@ -264,7 +264,7 @@
 \begin{frame}{Setting 0: Results}
   \textit{Minimum RMSE at assumed $\rho \approx \rho^*$. Model is identifiable.}
   \begin{center}
-    \includegraphics[width=0.92\textwidth]{../figures/setting0_rho_curve.png}
+    \includegraphics[width=0.92\textwidth]{figures/setting0_rho_curve.png}
   \end{center}
 \end{frame}
 
@@ -287,7 +287,7 @@
 \begin{frame}{Setting 1: Results}
   \textit{Copula mismatch shifts optimal $\rho$ and inflates RMSE.}
   \begin{center}
-    \includegraphics[width=0.92\textwidth]{../figures/setting1_rho_curve.png}
+    \includegraphics[width=0.92\textwidth]{figures/setting1_rho_curve.png}
   \end{center}
 \end{frame}
 
@@ -324,62 +324,33 @@
 \section{Extension}
 % =============================================================================
 
-% ── 13b. Motivation: Per-Category Setup ──────────────────────────────────────
-\begin{frame}{Motivation: One Model Per Category}
-  \textit{For discrete $X$: run the setup separately for each group.}
-  \begin{columns}[c]
-    \column{0.5\textwidth}
-    \centering\textbf{$X = \text{low}$}\\[10pt]
-    \[
-      (z_A,z_Y)\sim\mathcal{N}\!\left(\mathbf{0},\Sigma_{\rho_{\text{low}}}\right)
-    \]
-    \centering weak confounding
-
-    \column{0.5\textwidth}
-    \centering\textbf{$X = \text{high}$}\\[10pt]
-    \[
-      (z_A,z_Y)\sim\mathcal{N}\!\left(\mathbf{0},\Sigma_{\rho_{\text{high}}}\right)
-    \]
-    \centering strong confounding
-  \end{columns}
+% ── 15. Piecewise Copula: Setting ────────────────────────────────────────────
+\begin{frame}{Extension: Stratified Models}
+  \textit{DGP with heterogeneous confounding; $\rho$ depends on observed $X$.}
+  \[
+    X \sim \mathrm{Uniform}(-1,1),\qquad
+    \rho(X) =
+    \begin{cases}
+      -0.5 & X < 0 \\
+       0.8 & X \ge 0
+    \end{cases}
+  \]
   \medskip
-  \begin{center}\itshape
-    V2 generalises this: feed $X$ as context to a single flow.
-  \end{center}
+  \textbf{Three estimators compared:}
+  \begin{itemize}
+    \item \textcolor{orange}{\textbf{fixed $\rho=0.15$}} — global average, homogeneous assumption
+    \item \textcolor{violet}{\textbf{fixed $\rho=0$}} — no confounding assumed
+    \item \textcolor{ForestGreen}{\textbf{split $\rho$ (baseline)}} — two separate models, one per half; combined ATE:
+    \[
+      \hat\tau = \tfrac{n_-}{n}\,\hat\tau_- + \tfrac{n_+}{n}\,\hat\tau_+
+    \]
+  \end{itemize}
 \end{frame}
 
-% ── 14. Extension: Context Conditioning ──────────────────────────────────────
-\begin{frame}{Extension: Context Conditioning}
-  \textit{\textbf{V1}: no context \quad \textbf{V2}: condition on $X$}
+% ── 16. Piecewise Copula: Results ─────────────────────────────────────────────
+\begin{frame}{Extension: Stratified Models — Results}
   \begin{center}
-    \includegraphics[width=0.95\textwidth]{../figures/setting2_comparison.png}
-  \end{center}
-  V1 and V2 nearly identical: context conditioning does not fix the copula.
-\end{frame}
-
-% ── 15. Further Extension: ρ(X) Conditional Copula ──────────────────────────
-\begin{frame}{Further Extension: Covariate-Dependent Copula}
-  \textit{V2 fixes the copula; V3 learns $\rho(X)$.}
-  \begin{columns}[c]
-    \column{0.46\textwidth}
-    \centering\textbf{V2}\\[8pt]
-    $\rho$ global; $X$ in flow only.
-    \[
-      z\sim\mathcal{N}\!\left(\mathbf{0},\,\Sigma_{\textcolor{red}{\rho}}\right)
-    \]
-
-    \column{0.54\textwidth}
-    \centering\textbf{V3}\\[8pt]
-    \[
-      \rho(X) = \tanh\!\bigl(\mathrm{MLP}(X)\bigr)
-    \]
-    \[
-      z\sim\mathcal{N}\!\left(\mathbf{0},\,\Sigma_{\textcolor{blue}{\rho(X)}}\right)
-    \]
-  \end{columns}
-  \medskip
-  \begin{center}\itshape
-    Practitioner specifies a function, not a scalar. Models heterogeneous confounding.
+    \includegraphics[width=0.95\textwidth]{figures/ate_figure.png}
   \end{center}
 \end{frame}
 
@@ -392,8 +363,9 @@
     \item Assumptions are strong; require expert knowledge to argue.
     \item Not robust to copula misspecification (Setting~1).
     \item Extended the flow to condition on $X$ (V2).
-    \item V2 relaxes the homogeneous-confounding assumption.
-    \item \alert{But shifts more uncheckable work to the practitioner.}
+    \item Stratified models: fit one $\rho$-GNF per covariate stratum, combine ATEs.
+    \item Handles heterogeneous confounding — at the cost of $K$ model fits.
+    \item \alert{But $\rho_k$ per stratum must still be specified by the practitioner.}
   \end{itemize}
 \end{frame}
 

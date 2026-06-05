@@ -47,9 +47,9 @@ TRUE_TAU      = TRUE_THETA / (TRUE_THETA + 2)            # Kendall's τ = 0.5
 RHO_ASSUMED   = float(np.sin(np.pi * TRUE_TAU / 2))     # ≈ 0.707
 
 # ── Sweep parameters ──────────────────────────────────────────────────────────
-ALPHA_VALUES = [-1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0]
-N_SEEDS      = 5
-N_SAMPLES    = 5_000
+ALPHA_VALUES = [-1.0, -0.5, -0.2, 0.0, 0.2, 0.5, RHO_ASSUMED, 1.0]
+N_SEEDS      = 20
+N_SAMPLES    = 1_000
 
 # ── Model / training config ───────────────────────────────────────────────────
 CONFIG = dict(
