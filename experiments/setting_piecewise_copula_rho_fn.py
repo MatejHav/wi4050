@@ -66,8 +66,8 @@ TRUE_EY1 = float(RHO_POS * scipy_norm.ppf(_u1))
 TRUE_ATE  = TRUE_EY1 - TRUE_EY0
 
 # ── Experiment parameters ─────────────────────────────────────────────────────
-N_SEEDS   = 5
-N_SAMPLES = 1_000
+N_SEEDS   = 20
+N_SAMPLES = 5_000
 
 CONFIG = dict(
     emb_net         = [20, 15, 10],
