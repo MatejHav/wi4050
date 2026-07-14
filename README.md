@@ -19,6 +19,72 @@ pip install -r requirements.txt
 # Code architecture
 This repository provides some code to build diverse types normalizing flow models in PyTorch. The core components are located in the **models** folder. The different flow models are described in the file **NormalizingFlow.py** and they all follow the structure of the parent **class NormalizingFlow**.
 A flow step is usually designed as a combination of a **normalizer** (such as the ones described in Normalizers sub-folder) with a **conditioner** (such as the ones described in Conditioners sub-folder). Following the code hierarchy provided makes the implementation of new conditioners, normalizers or even complete flow architecture very easy.
+
+# Sensitivity analysis experiments
+
+The `experiments/` folder holds the synthetic studies used in the accompanying report (`report.tex`). Each script is self-contained: the data-generating process (DGP), sample size, number of seeds, and model hyperparameters are constants defined at the top of the file, so there are no command-line arguments. Shared model-building and training helpers live in `experiments/utils.py`.
+
+## Running
+
+Run any experiment from the repository root:
+
+```bash
+python experiments/setting0_rho_sweep.py
+```
+
+Each script inserts the repo root onto `sys.path`, so it also works as a module (`python -m experiments.setting0_rho_sweep`) and can be launched from any working directory. A GPU is used automatically when `torch.cuda.is_available()`, otherwise everything runs on CPU. Every script creates its own folder under `experiments/results/<name>/` and writes a `results.npz` (raw estimates) together with one or more `.png` figures. Re-running a script overwrites the files in its own folder. The figures already committed there are the ones reproduced in the report.
+
+## Experiment index
+
+The experiments follow the three-setting storyline of the report: a correctly specified Gaussian copula, a misspecified copula family, and covariate-dependent confounding.
+
+### Setting 0 — correctly specified Gaussian copula (sanity check)
+
+Data come from a Gaussian copula, so the model's assumption holds exactly.
+
+| Script | What it does | Output (`experiments/results/...`) |
+|---|---|---|
+| `setting0_baseline.py` | Control run: model given the true ρ, expects near-zero bias and low variance. | `setting0/` |
+| `setting0_rho_sweep.py` | The ρ-curve. Fixes true ρ=0.3, sweeps the assumed ρ over [−1,1], and shows the estimate passing through the true ATE at the true ρ. **(report Figure 1)** | `setting0_rho_sweep/setting0_rho_curve.png`, `results.npz` |
+| `setting0_ate_sweep.py` | RMSE as the true ATE magnitude grows, with the correct ρ supplied throughout. | `setting0_ate_sweep/rmse_vs_ate.png`, `results.npz` |
+
+### Setting 1 — misspecified copula family (Clayton)
+
+Data come from a Clayton copula (lower-tail dependence) while the model still assumes a Gaussian copula.
+
+| Script | What it does | Output (`experiments/results/...`) |
+|---|---|---|
+| `setting1_rho_sweep.py` | The ρ-curve under Clayton data. The best assumed ρ (≈0.33) sits far from the rank-matched reference ρ≈0.707. **(report Figure 2)** | `setting1_rho_sweep/setting1_rho_curve.png`, `results.npz` |
+| `setting1_ate_sweep.py` | RMSE vs true ATE under Clayton data, with the Gaussian-equivalent ρ plugged in. | `setting1_ate_sweep/rmse_vs_ate.png`, `results.npz` |
+
+### Distributional diagnostics (Settings 0 & 1)
+
+These visualise what the flow learns rather than reporting an ATE table.
+
+| Script | What it does | Output (`experiments/results/...`) |
+|---|---|---|
+| `setting01_interventional_sweep.py` | Learned Y\|do(A=0) and Y\|do(A=1) distributions as the assumed ρ varies, for both the Gaussian and Clayton DGPs. | `setting01_interventional_sweep/interventional_sweep.png` |
+| `setting01_zy_distribution.py` | Observed (confounded) Y against the true interventional targets N(0,1) and N(α,1) across ρ values. | `setting01_zy_distribution/zy_distribution.png` |
+
+### Setting 2 — covariate-dependent confounding
+
+The confounding strength depends on an observed covariate X. These scripts also exercise the context extension (V2), which feeds X into the `DAGConditioner`.
+
+| Script | What it does | Output (`experiments/results/...`) |
+|---|---|---|
+| `setting2_context.py` | Heterogeneous Clayton with θ(X) increasing in X. Compares V1 (no context) vs V2 (X as context) across assumed ρ. | `setting2_context/setting2_comparison.png`, `results.npz` |
+| `setting_mixed_copula.py` | Regime-switching copula: Clayton for X<0, Gumbel for X≥0, matched on Kendall's τ. V1 vs V2. | `setting_mixed_copula/comparison.png`, `results.npz` |
+| `setting_piecewise_copula.py` | Piecewise Gaussian copula ρ(X)=−0.5 (X<0) / 0.8 (X≥0) with a binary treatment. Compares two fixed-ρ models against a split-ρ oracle given the true ρ(X); the oracle is unbiased on average but high-variance. **(report Figure 3 and Table 1)** | `setting_piecewise_copula/ate_figure.png`, `results.npz` |
+| `setting_piecewise_copula_rho_fn.py` | Same piecewise idea, but ρ(X) is supplied to the model as a Python callable `rho_fn(x)` (ρ(X)=−0.5 / 0.3), compared against fixed-ρ baselines. | `setting_piecewise_copula_rho_fn/ate_figure.png`, `results.npz` |
+
+## Tests
+
+A small unit test covers the piecewise `rho_fn` helper:
+
+```bash
+pytest tests/test_rho_fn.py
+```
+
 #  $\rho$-GNF PGM2024 submission experiments
 ## Three different settings of datasets and experiments presented in our $\rho$-GNF PGM2024 submission
 ### 1. Simulated dataset with  ``Continuous variables`` with the code `python ToySimulatedContinuous.py -h`.

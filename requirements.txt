@@ -17,3 +17,6 @@ scipy>=1.14.0
 seaborn>=0.13.0
 sympy>=1.13.0
 umnn>=1.68
+
+# test-only (tests/test_rho_fn.py); not needed to run the experiments
+pytest>=8.0
